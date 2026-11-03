@@ -2,15 +2,19 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "module description"
+      "value": "DJI Neo 2 foreground engineering control console"
     },
     {
       "name": "EntryAbility_desc",
-      "value": "description"
+      "value": "Neo 2 engineering control console"
     },
     {
       "name": "EntryAbility_label",
-      "value": "label"
+      "value": "NEO 2 CONTROL"
+    },
+    {
+      "name": "microphone_reason",
+      "value": "用于用户主动开启的本地飞控语音识别"
     }
   ]
 }
