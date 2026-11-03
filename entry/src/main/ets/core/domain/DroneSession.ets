@@ -8,7 +8,7 @@ import { OuterPacket, parseOuterPacket } from '../protocol/OuterCodec';
 import { axesForMovement, buildStickPayload, INITIAL_PAYLOAD, StickAxes } from '../protocol/StickCodec';
 import { VideoAssembler, VideoAssemblerSnapshot } from '../media/VideoAssembler';
 import { DroneUdpChannel, DroneWifiSelection } from '../platform/DroneUdpChannel';
-import { ErrorLayer, failure, OperationResult, success } from './OperationResult';
+import { CancellationToken, ErrorLayer, failure, OperationResult, success } from './OperationResult';
 import { TelemetrySnapshot, TelemetryStore } from './TelemetryStore';
 import { RegistrationExchange, RegistrationSnapshot } from '../transport/RegistrationExchange';
 import { ReliableTransport, ReliableTransportSnapshot } from '../transport/ReliableTransport';
@@ -333,7 +333,8 @@ export class DroneSession {
   }
 
   async requestNative(receiver: number, commandSet: number, commandId: number, payload: Uint8Array,
-    timeoutMs: number = 2000): Promise<Uint8Array | undefined> {
+    timeoutMs: number = 2000, token?: CancellationToken): Promise<Uint8Array | undefined> {
+    if (token?.isCancelled()) throw new Error('操作已取消，未发送后续指令');
     if (timeoutMs <= 0 || timeoutMs > 3000) {
       throw new Error('Native request timeout is outside bounds');
     }

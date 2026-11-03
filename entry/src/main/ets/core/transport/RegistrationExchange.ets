@@ -164,7 +164,8 @@ export class RegistrationExchange {
     if (nowMs >= this.heartbeatAt) {
       const heartbeat = this.requiredTemplate('heartbeat');
       const payload = fromHex(heartbeat.payloadHex);
-      payload.set(this.remoteState, 24);
+      // Original PC fix: aircraft 04/04/04 corresponds to local 05/04/04 in Fly captures.
+      payload.set(toHex(this.remoteState) === '040404' ? new Uint8Array([5, 4, 4]) : this.remoteState, 24);
       writeU32LE(payload, 39, this.heartbeatCounter >>> 0);
       writeU32LE(payload, 43, Math.floor(nowMs - this.startedAt) >>> 0);
       payload.set(this.remoteTail, 52);

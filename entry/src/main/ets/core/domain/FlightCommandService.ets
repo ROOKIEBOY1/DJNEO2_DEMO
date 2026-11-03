@@ -89,6 +89,8 @@ export class FlightCommandService {
     try {
       const reply = await this.session.requestFlight(1);
       this.takeoffAcknowledgedValue = isSuccessReply(reply);
+      if (!this.takeoffAcknowledgedValue) return failure(ErrorLayer.COMMAND, 'TAKEOFF_UNCONFIRMED',
+        `起飞请求未获成功回复（${replyHex(reply)}）；飞机仍可能已起飞，请观察或降落`);
       return success(replyHex(reply));
     } catch (error) {
       return failure(ErrorLayer.COMMAND, 'TAKEOFF_SEND_FAILED', errorMessage(error));
@@ -108,7 +110,7 @@ export class FlightCommandService {
     if (this.landRequestedValue || this.landSentValue) {
       return failure(ErrorLayer.FLIGHT, 'LANDING_LOCK', 'Directional movement is locked after landing starts');
     }
-    if (!this.takeoffAcknowledgedValue && !this.nativeManualControlReady()) {
+    if (this.nativeTaskMayFlyValue ? !this.nativeManualControlReady() : !this.takeoffAcknowledgedValue) {
       return failure(ErrorLayer.FLIGHT, 'NOT_AIRBORNE_VERIFIED',
         'Movement requires a takeoff acknowledgement or verified post-circle hover handoff');
     }
@@ -165,6 +167,8 @@ export class FlightCommandService {
       this.landSentValue = true;
       const reply = await this.session.requestFlight(2);
       this.landAcknowledgedValue = isSuccessReply(reply);
+      if (!this.landAcknowledgedValue) return failure(ErrorLayer.COMMAND, 'LAND_UNCONFIRMED',
+        `降落请求未获成功回复（${replyHex(reply)}）；尚未确认落地`);
       return success(replyHex(reply));
     } catch (error) {
       return failure(ErrorLayer.COMMAND, 'LAND_SEND_FAILED', errorMessage(error));
@@ -172,6 +176,9 @@ export class FlightCommandService {
   }
 
   prepareGroundedCycle(confirmedGrounded: boolean): OperationResult<boolean> {
+    if (this.movementActiveValue || !this.session.isActionLinkFresh()) {
+      return failure(ErrorLayer.FLIGHT, 'GROUND_RESET_NOT_READY', '动作尚未结束或链路不新鲜，不能重建飞行状态');
+    }
     if (!confirmedGrounded) {
       return failure(ErrorLayer.FLIGHT, 'GROUND_CONFIRMATION_REQUIRED',
         'The operator must visually confirm that the aircraft is grounded', false);
@@ -239,7 +246,8 @@ export class FlightCommandService {
     const task = telemetry.task;
     return flight !== undefined && telemetry.flightAgeMs !== undefined && telemetry.flightAgeMs <= 1000 &&
       flight.observedAtMs >= this.nativeStopConfirmedAtValue && flight.motorsOn && flight.airborne &&
-      flight.modeRaw === 6 && task !== undefined && task.observedAtMs >= this.nativeStopConfirmedAtValue &&
+      flight.modeRaw === 6 && task !== undefined && telemetry.taskAgeMs !== undefined && telemetry.taskAgeMs <= 1000 &&
+      task.observedAtMs >= this.nativeStopConfirmedAtValue &&
       (task.payloadHex === '0000000101' || task.payloadHex === '0000000102');
   }
 

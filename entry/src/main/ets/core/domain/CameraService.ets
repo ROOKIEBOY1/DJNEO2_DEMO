@@ -48,6 +48,32 @@ export class CameraService {
     return this.capture(true, token);
   }
 
+  async prepareVideoMode(token?: CancellationToken): Promise<OperationResult<string>> {
+    if (this.operationActive) return failure(ErrorLayer.TASK, 'CAMERA_BUSY', '相机正在处理其他操作');
+    this.operationActive = true;
+    try {
+      this.ensureNotCancelled(token); this.ensureFresh(); this.requireIdle();
+      if (this.session.snapshot().telemetry.camera?.timeSynchronized !== true) {
+        const synced = await this.synchronizeClock(token);
+        if (!synced.ok) return synced;
+      }
+      this.ensureNotCancelled(token); this.requireIdle();
+      const sentAt = Date.now();
+      const reply = await this.session.requestNative(1, 2, 0xff, VIDEO_MODE, 2000, token);
+      if (!successReply(reply)) throw new Error('相机录像模式设置未获成功回复');
+      const deadline = Date.now() + 2000;
+      while (Date.now() < deadline) {
+        this.ensureNotCancelled(token); this.ensureFresh(); this.requireIdle();
+        const telemetry = this.session.snapshot().telemetry;
+        if (telemetry.camera !== undefined && telemetry.camera.observedAtMs >= sentAt &&
+          telemetry.camera.modeRaw === 1 && telemetry.camera.timeSynchronized) return success('录像模式已观察确认');
+        await delay(50);
+      }
+      throw new Error('未观察到新的录像模式状态，未启动任务');
+    } catch (error) { return failure(ErrorLayer.TASK, 'VIDEO_MODE_NOT_OBSERVED', errorMessage(error)); }
+    finally { this.operationActive = false; }
+  }
+
   async stopRecording(): Promise<OperationResult<string>> {
     try {
       this.ensureFresh();
@@ -97,7 +123,8 @@ export class CameraService {
       }
       if (!recording) {
         this.ensurePhotoContextSafe();
-        const contextReply = await this.session.requestNative(0x17, 3, 0xf9, PHOTO_CONTEXT_PAYLOAD);
+        this.ensureNotCancelled(token);
+        const contextReply = await this.session.requestNative(0x17, 3, 0xf9, PHOTO_CONTEXT_PAYLOAD, 2000, token);
         if (contextReply === undefined || !bytesEqual(contextReply,
           concatBytes(new Uint8Array([0]), PHOTO_CONTEXT_PAYLOAD))) {
           return failure(ErrorLayer.COMMAND, 'PHOTO_CONTEXT_FAILED',
@@ -107,7 +134,8 @@ export class CameraService {
       this.requireIdle();
       const mode = recording ? VIDEO_MODE : PHOTO_MODE;
       validateCameraRequest(0xff, mode);
-      const modeReply = await this.session.requestNative(1, 2, 0xff, mode);
+      this.ensureNotCancelled(token);
+      const modeReply = await this.session.requestNative(1, 2, 0xff, mode, 2000, token);
       if (!successReply(modeReply)) {
         return failure(ErrorLayer.COMMAND, 'CAMERA_MODE_FAILED',
           `Camera mode reply was ${replyDescription(modeReply)}; capture command was not sent`);
@@ -121,7 +149,7 @@ export class CameraService {
       const trigger = new Uint8Array([1]);
       const command = recording ? 2 : 1;
       validateCameraRequest(command, trigger);
-      const reply = await this.session.requestNative(1, 2, command, trigger);
+      const reply = await this.session.requestNative(1, 2, command, trigger, 2000, token);
       return success(reply === undefined ? 'no_reply' : toHex(reply));
     } catch (error) {
       return failure(ErrorLayer.TASK, 'CAMERA_CAPTURE_FAILED', errorMessage(error));
@@ -135,7 +163,7 @@ export class CameraService {
     const sentAt = Date.now();
     const payload = buildCameraTime(sentAt);
     validateCameraRequest(0x54, payload);
-    const reply = await this.session.requestNative(1, 2, 0x54, payload);
+    const reply = await this.session.requestNative(1, 2, 0x54, payload, 2000, token);
     if (!successReply(reply)) {
       return failure(ErrorLayer.COMMAND, 'CAMERA_TIME_FAILED', 'Camera clock request was not acknowledged');
     }

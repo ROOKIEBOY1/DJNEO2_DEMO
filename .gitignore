@@ -10,3 +10,8 @@
 /.clang-tidy
 **/.test
 /.appanalyzer
+/diagnostics/
+*.hap
+*.p12
+*.p7b
+*.csr

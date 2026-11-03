@@ -1,11 +1,14 @@
-import { CircleTask } from './CircleTask';
+import { NativeTaskConfig, NativeTaskService, NativeTaskSnapshot } from './NativeTaskService';
+import { DollyFraming, NativeTaskKind } from '../protocol/NativeTaskCodec';
+import { VoiceMotion } from './VoiceMotion';
+import { fileIo } from '@kit.CoreFileKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { CameraService } from './CameraService';
 import { DroneSession, DroneSessionSnapshot } from './DroneSession';
 import { FlightCommandService, FlightCommandSnapshot } from './FlightCommandService';
 import { MediaRepository } from '../media/MediaRepository';
 import { MediaKind } from '../media/MediaDirectory';
-import { ErrorLayer, failure, OperationResult } from './OperationResult';
+import { CancellationToken, ErrorLayer, failure, OperationResult, success } from './OperationResult';
 import { MovementDirection } from '../protocol/StickCodec';
 import { VoiceCommand, VoiceCommandAdapter, VoiceCommandSnapshot } from './VoiceCommandAdapter';
 import { Context } from '@kit.AbilityKit';
@@ -25,6 +28,10 @@ export interface ConsoleSnapshot {
   cameraBusy: boolean;
   recordingRequested: boolean;
   voice: VoiceCommandSnapshot;
+  nativeTask: NativeTaskSnapshot;
+  nativeConfig: NativeTaskConfig;
+  calibrationSummary: string;
+  defaultMovementSeconds: number;
   busy: boolean;
   lastOperation: string;
   lastErrorLayer: string;
@@ -37,7 +44,7 @@ export type ConsoleListener = (snapshot: ConsoleSnapshot) => void;
 export class AppController {
   readonly session: DroneSession;
   readonly flight: FlightCommandService;
-  readonly circle: CircleTask;
+  readonly nativeTasks: NativeTaskService;
   readonly media: MediaRepository;
   readonly camera: CameraService;
   readonly voice: VoiceCommandAdapter = new VoiceCommandAdapter();
@@ -47,6 +54,11 @@ export class AppController {
   private readonly wifi: NeoWifiLink = new NeoWifiLink();
   private listener?: ConsoleListener;
   private busyValue: boolean = false;
+  private activeOperations: number = 0;
+  private defaultMovementSeconds: number = 0.5;
+  private operationToken?: CancellationToken;
+  private readonly motion: VoiceMotion = new VoiceMotion();
+  private nativeConfig: NativeTaskConfig = { radiusMeters: 2, framing: '半身', zoom: 2, retreat: true };
   private lastOperationValue: string = '等待连接';
   private lastErrorLayerValue: string = '';
   private lastErrorValue: string = '';
@@ -58,9 +70,13 @@ export class AppController {
     this.profiles = new AircraftProfileStore(filesDirectory);
     this.session = new DroneSession();
     this.flight = new FlightCommandService(this.session);
-    this.circle = new CircleTask(this.session, this.flight);
     this.media = new MediaRepository(this.session);
     this.camera = new CameraService(this.session, this.media);
+    this.nativeTasks = new NativeTaskService(this.session, this.flight, this.camera);
+    try {
+      const path = `${filesDirectory}/voice-calibration.json`;
+      if (fileIo.accessSync(path)) this.motion.importJson(fileIo.readTextSync(path));
+    } catch (error) { this.log(`标定文件未载入：${asError(error).message}`); }
     this.speech = new LocalSpeechRecognizer(context, this.voice);
     this.speech.setStatusListener((message: string) => {
       this.log(message);
@@ -70,6 +86,9 @@ export class AppController {
     this.voice.setListener((command: VoiceCommand) => {
       this.executeVoice(command).catch((error: Error) => this.recordException('语音命令', error));
     });
+    this.voice.setStatusListener(() => this.emit());
+    this.voice.setBusyProvider(() => this.busyValue);
+    this.voice.setMovementDurationProvider(() => this.defaultMovementSeconds);
   }
 
   setListener(listener?: ConsoleListener): void {
@@ -78,7 +97,7 @@ export class AppController {
   }
 
   snapshot(): ConsoleSnapshot {
-    const circle = this.circle.snapshot();
+    const circle = this.nativeTasks.snapshot();
     const camera = this.camera.snapshot();
     return {
       aircraftProfiles: this.profiles.list(),
@@ -92,6 +111,11 @@ export class AppController {
       cameraBusy: camera.operationActive,
       recordingRequested: camera.recordingRequested,
       voice: this.voice.snapshot(),
+      nativeTask: circle,
+      nativeConfig: { radiusMeters: this.nativeConfig.radiusMeters, framing: this.nativeConfig.framing,
+        zoom: this.nativeConfig.zoom, retreat: this.nativeConfig.retreat },
+      calibrationSummary: this.motion.summary(),
+      defaultMovementSeconds: this.defaultMovementSeconds,
       busy: this.busyValue,
       lastOperation: this.lastOperationValue,
       lastErrorLayer: this.lastErrorLayerValue,
@@ -191,7 +215,7 @@ export class AppController {
         }
         const runtime = this.profiles.runtime(this.profiles.selectedId());
         this.flight.resetForAircraftSession();
-        this.circle.resetForAircraftSession();
+        this.nativeTasks.resetForAircraftSession();
         this.camera.resetForAircraftSession();
         this.wifiProgressValue = '检查目标飞机 Wi-Fi';
         this.emit();
@@ -211,42 +235,119 @@ export class AppController {
   async connect(): Promise<void> { await this.connectSelectedAircraft(); }
   async initialize(): Promise<void> { await this.run('初始化', () => this.session.initialize()); }
   async disconnect(): Promise<void> {
+    this.cancelOperations();
     await this.run('断开', async () => {
+      if (this.nativeTasks.activeOrUnknown()) this.recordResult('停止原生任务', await this.nativeTasks.stop());
       const result = await this.flight.foregroundOnlySafetyShutdown();
       await this.wifi.leave();
       this.wifiProgressValue = '已断开并清理 Wi-Fi 候选配置';
       return result;
     }, false);
   }
-  async takeoffConfirmed(): Promise<void> { await this.run('起飞请求', () => this.flight.takeoff(true)); }
-  async land(): Promise<void> { await this.run('降落请求', () => this.flight.land(), false); }
-  async center(): Promise<void> { await this.run('摇杆回中', () => this.flight.centerSticks(), false); }
-  async move(direction: MovementDirection, seconds: number): Promise<void> {
-    await this.run(`移动 ${direction} ${seconds.toFixed(1)}s`, () => this.flight.move(direction, seconds));
+  async takeoffConfirmed(): Promise<void> {
+    if (this.busyValue) { this.log('当前操作未结束，未排队起飞'); this.emit(); return; }
+    const current = this.flight.snapshot();
+    if (current.takeoffSent || current.nativeTaskMayFly || current.landRequested) {
+      const reset = this.flight.prepareGroundedCycle(true);
+      if (!reset.ok) { this.recordResult('准备重飞', reset); return; }
+    }
+    // The cycle reset is synchronous; run now allocates a token for the new generation.
+    await this.run('起飞请求', (token: CancellationToken) => this.flight.takeoff(true, token));
   }
-  async prepareCircle(): Promise<void> { await this.run('准备 2 米环绕', () => this.circle.prepare(2)); }
-  async startCircleConfirmed(): Promise<void> {
-    await this.run('启动环绕', async () => {
-      const started = await this.circle.start(true);
-      if (started.ok) {
-        this.circle.waitExecution().then(result => this.recordResult('观察环绕执行', result));
+  async land(): Promise<void> {
+    const task = this.nativeTasks.snapshot();
+    this.cancelOperations();
+    await this.run('降落请求', async () => {
+      if (task.busy || task.prepared || task.activeOrUnknown) this.recordResult('停止原生任务', await this.nativeTasks.stop());
+      return this.flight.land();
+    }, false);
+  }
+  async center(): Promise<void> {
+    const task = this.nativeTasks.snapshot(); this.cancelOperations();
+    await this.run('停止/回中', async () => {
+      if (task.busy || task.prepared || task.activeOrUnknown) return this.nativeTasks.stop();
+      const result = await this.flight.centerSticks();
+      return result.ok ? success('已回中') : failure<string>(ErrorLayer.COMMAND, 'CENTER_FAILED', result.error?.message ?? '回中失败');
+    }, false);
+  }
+  async move(direction: MovementDirection, seconds: number): Promise<void> {
+    await this.run(`移动 ${direction} ${seconds.toFixed(1)}s`, (token: CancellationToken) => this.flight.move(direction, seconds, token));
+  }
+  setMovementSeconds(seconds: number): void {
+    if (!Number.isFinite(seconds) || seconds < 0.5 || seconds > 10) return;
+    this.defaultMovementSeconds = seconds; this.emit();
+  }
+  async prepareCircle(): Promise<void> { await this.prepareNative('circle'); }
+  async startCircleConfirmed(): Promise<void> { await this.startNativeConfirmed('circle'); }
+  async stopCircle(): Promise<void> { await this.center(); }
+  async prepareNative(kind: NativeTaskKind): Promise<void> {
+    await this.run(`准备${this.taskLabel(kind)}`, (token: CancellationToken) => this.nativeTasks.prepare(kind, this.nativeConfig, token));
+  }
+  async startNativeConfirmed(kind: NativeTaskKind): Promise<void> {
+    await this.run(`启动${this.taskLabel(kind)}`, async (token: CancellationToken) => {
+      const task = this.nativeTasks.snapshot();
+      if (!task.prepared || task.kind !== kind) {
+        const prepared = await this.nativeTasks.prepare(kind, this.nativeConfig, token);
+        if (!prepared.ok) return failure<string>(ErrorLayer.TASK, 'NATIVE_PREPARE_REQUIRED', prepared.error?.message ?? '任务准备失败');
       }
-      return started;
+      return this.nativeTasks.start(true, token);
     });
   }
-  async stopCircle(): Promise<void> { await this.run('停止环绕', () => this.circle.stop(), false); }
-  async shoot(): Promise<void> { await this.run('拍照', () => this.camera.shoot()); }
-  async startRecording(): Promise<void> { await this.run('开始录像', () => this.camera.startRecording()); }
-  async stopRecording(): Promise<void> { await this.run('停止录像', () => this.camera.stopRecording(), false); }
-  async listMedia(): Promise<void> { await this.run('刷新媒体目录', () => this.camera.listMedia()); }
-  async downloadLatest(kind: MediaKind): Promise<void> {
-    await this.run(`下载最新${kind === 'photo' ? '照片' : '视频'}`,
-      () => this.camera.downloadLatest(kind, this.outputDirectory));
+  setTaskSettings(radius: number, framing: DollyFraming, zoom: number, retreat: boolean): void {
+    if (this.busyValue || this.nativeTasks.activeOrUnknown()) { this.log('先停止当前操作，再修改任务参数'); this.emit(); return; }
+    if (!Number.isFinite(radius) || radius < 2 || radius > 10 || !['半身', '全身', '远景'].includes(framing) || (zoom !== 2 && zoom !== 3)) return;
+    this.voice.cancelPending(); this.nativeTasks.cancel();
+    this.nativeConfig = { radiusMeters: radius, framing: framing, zoom: zoom, retreat: retreat };
+    this.log(`任务参数：环绕${radius}米 / ${framing} / 1–${zoom}倍 / 渐远${retreat ? '开' : '关'}`); this.emit();
   }
+  recordCalibration(direction: MovementDirection, seconds: number, amount: number): void {
+    if (this.busyValue || this.nativeTasks.activeOrUnknown()) return;
+    try {
+      this.motion.record(direction, seconds, amount);
+      const path = `${this.outputDirectory}/voice-calibration.json`;
+      const file = fileIo.openSync(`${path}.tmp`, fileIo.OpenMode.CREATE | fileIo.OpenMode.WRITE_ONLY | fileIo.OpenMode.TRUNC);
+      try { fileIo.writeSync(file.fd, this.motion.exportJson()); fileIo.fsyncSync(file.fd); }
+      finally { fileIo.closeSync(file); }
+      fileIo.renameSync(`${path}.tmp`, path);
+      this.log('实测标定已保存；米数/角度动作按标定估算');
+    } catch (error) { this.recordException('保存标定', asError(error)); }
+    this.emit();
+  }
+  async shoot(): Promise<void> {
+    await this.run('拍照', (token: CancellationToken) => {
+      if (this.nativeTasks.activeOrUnknown()) return Promise.resolve(failure<string>(ErrorLayer.TASK, 'NATIVE_CONTEXT_ACTIVE', '先停止原生任务，再切换拍照上下文'));
+      this.nativeTasks.cancel(); this.voice.cancelPending();
+      return this.camera.shoot(token);
+    });
+  }
+  async startRecording(): Promise<void> { await this.run('开始录像', (token: CancellationToken) => this.camera.startRecording(token)); }
+  async stopRecording(): Promise<void> {
+    this.cancelOperations(); await this.run('停止录像', () => this.camera.stopRecording(), false);
+  }
+  async listMedia(): Promise<void> {
+    await this.run('刷新媒体目录', async (token: CancellationToken) => {
+      const result = await this.camera.listMedia(token);
+      if (result.ok && result.data !== undefined) this.log(`相册${result.data.length}项：${result.data.slice(0, 5).map(item => item.name).join('、')}`);
+      return result;
+    });
+  }
+  async downloadLatest(kind: MediaKind): Promise<void> {
+    await this.run(`下载最新${kind === 'photo' ? '照片' : '视频'}`, async (token: CancellationToken) => {
+      const result = await this.camera.downloadLatest(kind, this.outputDirectory, token);
+      if (result.ok && result.data !== undefined) this.log(`原片已保存：${result.data.path}`);
+      return result;
+    });
+  }
+  private cancelOperations(): void {
+    this.operationToken?.cancel(); this.nativeTasks.cancel(); this.voice.cancelPending();
+  }
+  private taskLabel(kind: NativeTaskKind): string { return kind === 'circle' ? '环绕' : kind === 'follow' ? '跟随' : '滑动变焦'; }
 
   setVoiceEnabled(enabled: boolean): void {
     this.voice.setEnabled(enabled);
     if (!enabled) {
+      this.cancelOperations();
+      this.flight.centerSticks().catch((error: Error) => this.recordException('语音关闭回中', error));
       this.speech.stop(false).catch((error: Error) => this.recordException('关闭本地语音', error));
     }
     this.log(enabled ? '本地语音命令已启用' : '本地语音命令已禁用');
@@ -269,7 +370,7 @@ export class AppController {
 
   async stopListening(): Promise<void> {
     try {
-      await this.speech.stop(true);
+      await this.speech.stop(false);
     } catch (error) {
       this.recordException('停止本地语音', error instanceof Error ? error : new Error(String(error)));
     }
@@ -277,13 +378,8 @@ export class AppController {
   }
 
   submitTranscript(text: string): void {
-    const command = this.voice.acceptTranscript(text);
-    if (command === undefined && this.voice.snapshot().pendingConfirmation.length === 0) {
-      this.log(`未识别限定命令: ${text}`);
-    } else if (this.voice.snapshot().pendingConfirmation.length > 0) {
-      this.log('危险语音命令等待页面长按确认');
-    }
-    this.emit();
+    this.voice.acceptTranscript(text);
+    this.log(this.voice.snapshot().feedback); this.emit();
   }
 
   confirmPendingVoice(): void {
@@ -292,6 +388,7 @@ export class AppController {
   }
 
   async foregroundOnlySafetyShutdown(): Promise<void> {
+    const task = this.nativeTasks.snapshot(); this.cancelOperations();
     try {
       await this.speech.stop(false);
     } catch (error) {
@@ -299,6 +396,7 @@ export class AppController {
     }
     this.voice.setEnabled(false);
     this.log('应用进入后台，执行回中/降落保护并断开');
+    if (task.busy || task.prepared || task.activeOrUnknown) this.recordResult('停止原生任务', await this.nativeTasks.stop());
     await this.flight.foregroundOnlySafetyShutdown();
     await this.wifi.leave();
     this.wifiProgressValue = '后台安全断开完成';
@@ -318,35 +416,66 @@ export class AppController {
 
   private async executeVoice(command: VoiceCommand): Promise<void> {
     if (command.kind === 'land') return this.land();
-    if (command.kind === 'center') return this.center();
-    if (command.kind === 'circle_stop') return this.stopCircle();
-    if (command.kind === 'takeoff') return this.takeoffConfirmed();
-    if (command.kind === 'circle_prepare') return this.prepareCircle();
-    if (command.kind === 'circle_start') return this.startCircleConfirmed();
+    if (['center', 'circle_stop', 'follow_stop', 'dolly_stop'].includes(command.kind)) return this.center();
+    if (command.kind === 'pause') { this.setVoiceEnabled(false); return this.center(); }
+    if (command.kind === 'status') { this.log(`连接${this.session.snapshot().phase}；${this.nativeTasks.snapshot().kind}执行${this.nativeTasks.snapshot().executionObserved ? '已观察' : '未观察'}`); this.emit(); return; }
+    if (command.kind === 'takeoff' || command.kind === 'takeoff_again') return this.takeoffConfirmed();
+    if (command.kind === 'circle_prepare') return this.prepareNative('circle');
+    if (command.kind === 'follow_prepare') return this.prepareNative('follow');
+    if (command.kind === 'dolly_prepare') return this.prepareNative('dolly');
+    if (command.kind === 'circle_start') {
+      if (command.radiusMeters !== undefined) {
+        if (this.busyValue || this.nativeTasks.activeOrUnknown()) { this.log('先停止当前任务'); this.emit(); return; }
+        this.setTaskSettings(command.radiusMeters, this.nativeConfig.framing, this.nativeConfig.zoom, this.nativeConfig.retreat);
+      }
+      return this.startNativeConfirmed('circle');
+    }
+    if (command.kind === 'follow_start') return this.startNativeConfirmed('follow');
+    if (command.kind === 'dolly_start') return this.startNativeConfirmed('dolly');
+    if (command.kind === 'circle_radius' || command.kind === 'dolly_framing' || command.kind === 'dolly_zoom' || command.kind === 'dolly_retreat') {
+      this.setTaskSettings(command.kind === 'circle_radius' ? command.radiusMeters ?? 2 : this.nativeConfig.radiusMeters,
+        command.kind === 'dolly_framing' ? command.value as DollyFraming : this.nativeConfig.framing,
+        command.kind === 'dolly_zoom' ? Number(command.value) : this.nativeConfig.zoom,
+        command.kind === 'dolly_retreat' ? command.value === 'on' : this.nativeConfig.retreat); return;
+    }
     if (command.kind === 'photo') return this.shoot();
     if (command.kind === 'record_start') return this.startRecording();
     if (command.kind === 'record_stop') return this.stopRecording();
+    if (command.kind === 'media_list') return this.listMedia();
+    if (command.kind === 'download_photo') return this.downloadLatest('photo');
+    if (command.kind === 'download_video') return this.downloadLatest('video');
     if (command.kind === 'move' && command.direction !== undefined) {
-      return this.move(command.direction, command.durationSeconds ?? 0.5);
+      const segments = this.motion.plan(command); const direction = command.direction;
+      await this.run(`移动 ${direction} ${segments.reduce((sum: number, value: number) => sum + value, 0).toFixed(1)}s`, async (token: CancellationToken) => {
+        for (let i = 0; i < segments.length; i++) {
+          if (token.isCancelled()) return failure<boolean>(ErrorLayer.TASK, 'VOICE_MOVE_CANCELLED', '移动已取消');
+          const result = await this.flight.move(direction, segments[i], token);
+          if (!result.ok) return result;
+        }
+        return success(true);
+      });
     }
   }
 
-  private async run<T>(name: string, operation: () => Promise<OperationResult<T>>,
+  private async run<T>(name: string, operation: (token: CancellationToken) => Promise<OperationResult<T>>,
     rejectWhenBusy: boolean = true): Promise<void> {
     if (this.busyValue && rejectWhenBusy) {
       this.log(`${name}: 已有操作执行中`);
       this.emit();
       return;
     }
-    this.busyValue = true;
+    const token = this.flight.newCancellationToken();
+    if (rejectWhenBusy) this.operationToken = token;
+    this.activeOperations++; this.busyValue = true;
     this.lastOperationValue = name;
     this.emit();
     try {
-      this.recordResult(name, await operation());
+      this.recordResult(name, await operation(token));
     } catch (error) {
       this.recordException(name, error as Error);
     } finally {
-      this.busyValue = false;
+      if (this.operationToken === token) this.operationToken = undefined;
+      this.activeOperations--; this.busyValue = this.activeOperations > 0;
       this.emit();
     }
   }
@@ -355,7 +484,7 @@ export class AppController {
     if (result.ok) {
       this.lastErrorLayerValue = '';
       this.lastErrorValue = '';
-      this.log(`${name}: 完成`);
+      this.log(`${name}: ${typeof result.data === 'string' ? result.data : '完成'}`);
     } else {
       this.lastErrorLayerValue = result.error?.layer ?? 'unknown';
       this.lastErrorValue = result.error?.message ?? '未知错误';

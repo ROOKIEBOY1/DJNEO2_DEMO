@@ -1,13 +1,16 @@
 import { AppRuntime, ConsoleSnapshot } from '../core/domain/AppController';
 import { MovementDirection } from '../core/protocol/StickCodec';
 import { AircraftProfileSummary } from '../core/profile/AircraftProfileStore';
+import { DollyFraming } from '../core/protocol/NativeTaskCodec';
+
+interface HeaderView { title: string; detail: string; }
+interface DiagnosticView { label: string; value: string; }
 
 @Entry
 @Component
 struct Index {
   private controller = AppRuntime.controller();
   @State state: ConsoleSnapshot = this.controller.snapshot();
-  @State movementSeconds: number = 0.5;
   @State routingJson: string = '';
   @State registrationJson: string = '';
   @State profileName: string = 'Neo 2 12AD';
@@ -15,6 +18,10 @@ struct Index {
   @State profilePassword: string = '';
   @State creatingProfile: boolean = false;
   @State commandText: string = '';
+  @State calibrationDirection: MovementDirection = 'forward';
+  @State calibrationSeconds: string = '1';
+  @State calibrationAmount: string = '';
+  @State showCalibration: boolean = false;
 
   aboutToAppear(): void {
     this.controller.setListener((snapshot: ConsoleSnapshot) => this.state = snapshot);
@@ -29,7 +36,7 @@ struct Index {
   }
 
   private move(direction: MovementDirection): void {
-    this.controller.move(direction, this.movementSeconds);
+    this.controller.move(direction, this.state.defaultMovementSeconds);
   }
 
   private selectedProfile(): AircraftProfileSummary | undefined {
@@ -45,19 +52,19 @@ struct Index {
   }
 
   @Builder
-  SectionHeader(title: string, detail: string) {
+  SectionHeader($$: HeaderView) {
     Row() {
-      Text(title).fontSize(17).fontWeight(FontWeight.Bold).fontColor('#17202A')
+      Text($$.title).fontSize(17).fontWeight(FontWeight.Bold).fontColor('#17202A')
       Blank()
-      Text(detail).fontSize(12).fontColor('#667085').maxLines(1)
+      Text($$.detail).fontSize(12).fontColor('#667085').maxLines(1)
     }.width('100%').margin({ top: 16, bottom: 8 })
   }
 
   @Builder
-  Diagnostic(label: string, value: string) {
+  Diagnostic($$: DiagnosticView) {
     Column() {
-      Text(label).fontSize(11).fontColor('#667085')
-      Text(value).fontSize(14).fontWeight(FontWeight.Medium).fontColor('#1D2939').margin({ top: 2 })
+      Text($$.label).fontSize(11).fontColor('#667085')
+      Text($$.value).fontSize(14).fontWeight(FontWeight.Medium).fontColor('#1D2939').margin({ top: 2 })
     }.width('100%').height(54).alignItems(HorizontalAlign.Start).justifyContent(FlexAlign.Center)
       .padding({ left: 10 }).backgroundColor('#F9FAFB').borderRadius(4)
   }
@@ -77,7 +84,7 @@ struct Index {
 
       Scroll() {
         Column() {
-          this.SectionHeader('目标飞机', this.state.wifiProgress)
+          this.SectionHeader({ title: '目标飞机', detail: this.state.wifiProgress })
           Flex({ wrap: FlexWrap.Wrap }) {
             ForEach(this.state.aircraftProfiles, (profile: AircraftProfileSummary) => {
               Button(`${profile.displayName}\n${profile.ssid}`)
@@ -121,7 +128,7 @@ struct Index {
                 .onAction(() => this.controller.removeSelectedAircraft(true)))
           }.width('100%').margin({ top: 8 })
 
-          this.SectionHeader('连接与注册', `${this.state.session.localAddress} · ${this.state.session.sessionHex}`)
+          this.SectionHeader({ title: '连接与注册', detail: `${this.state.session.localAddress} · ${this.state.session.sessionHex}` })
           Row({ space: 8 }) {
             Button('连接').enabled(this.selectedProfile()?.configured === true &&
               this.selectedProfile()?.registrationReady === true &&
@@ -130,14 +137,14 @@ struct Index {
             Button('断开').buttonStyle(ButtonStyleMode.NORMAL).onClick(() => this.controller.disconnect())
           }.width('100%')
           Grid() {
-            GridItem() { this.Diagnostic('下行年龄', this.ageText(this.state.session.downlinkAgeMs)) }
-            GridItem() { this.Diagnostic('视频年龄', this.ageText(this.state.session.videoAgeMs)) }
-            GridItem() { this.Diagnostic('设备验证', this.state.session.deviceVerified ? '通过' : '未通过') }
-            GridItem() { this.Diagnostic('可靠窗口', `${this.state.session.transport?.pending ?? 0}/32`) }
-            GridItem() { this.Diagnostic('接收包', `${this.state.session.receivedPackets}`) }
-            GridItem() { this.Diagnostic('路由计数', `${this.state.session.routing?.next ?? '--'}`) }
-            GridItem() { this.Diagnostic('握手尝试', `${this.state.session.handshakeAttempt}/60`) }
-            GridItem() { this.Diagnostic('UDP 接收/发送', `${this.state.session.receivedDatagrams}/${this.state.session.sentDatagrams}`) }
+            GridItem() { this.Diagnostic({ label: '下行年龄', value: this.ageText(this.state.session.downlinkAgeMs) }) }
+            GridItem() { this.Diagnostic({ label: '视频年龄', value: this.ageText(this.state.session.videoAgeMs) }) }
+            GridItem() { this.Diagnostic({ label: '设备验证', value: this.state.session.deviceVerified ? '通过' : '未通过' }) }
+            GridItem() { this.Diagnostic({ label: '可靠窗口', value: `${this.state.session.transport?.pending ?? 0}/32` }) }
+            GridItem() { this.Diagnostic({ label: '接收包', value: `${this.state.session.receivedPackets}` }) }
+            GridItem() { this.Diagnostic({ label: '路由计数', value: `${this.state.session.routing?.next ?? '--'}` }) }
+            GridItem() { this.Diagnostic({ label: '握手尝试', value: `${this.state.session.handshakeAttempt}/60` }) }
+            GridItem() { this.Diagnostic({ label: 'UDP 接收/发送', value: `${this.state.session.receivedDatagrams}/${this.state.session.sentDatagrams}` }) }
           }.columnsTemplate('1fr 1fr').columnsGap(8).rowsGap(8).width('100%').margin({ top: 10 })
           Text(`UDP 来源：${this.state.session.lastUdpPeer}`).width('100%').fontSize(11)
             .fontColor('#667085').margin({ top: 6 })
@@ -160,7 +167,7 @@ struct Index {
             .enabled(this.registrationJson.trim().length > 0 && this.state.session.phase === 'disconnected')
             .onClick(() => this.controller.importRegistrationProfile(this.registrationJson))
 
-          this.SectionHeader('安全飞控', `${this.movementSeconds.toFixed(1)} 秒/次`)
+          this.SectionHeader({ title: '安全飞控', detail: `${this.state.defaultMovementSeconds.toFixed(1)} 秒/次（按钮/语音）` })
           Row({ space: 8 }) {
             Button('长按起飞 1.5s').layoutWeight(1).backgroundColor('#B54708')
               .gesture(LongPressGesture({ repeat: false, duration: 1500 }).onAction(() => this.controller.takeoffConfirmed()))
@@ -168,8 +175,8 @@ struct Index {
           }.width('100%')
           Row({ space: 8 }) {
             Text('0.5').fontSize(12).fontColor('#667085')
-            Slider({ value: this.movementSeconds, min: 0.5, max: 10, step: 0.5 }).layoutWeight(1)
-              .onChange((value: number) => this.movementSeconds = value)
+            Slider({ value: this.state.defaultMovementSeconds, min: 0.5, max: 10, step: 0.5 }).layoutWeight(1)
+              .onChange((value: number) => this.controller.setMovementSeconds(value))
             Text('10.0').fontSize(12).fontColor('#667085')
           }.width('100%').height(44)
           Column({ space: 8 }) {
@@ -192,15 +199,49 @@ struct Index {
           Text(`起飞请求:${this.state.flight.takeoffSent ? '是' : '否'} · ACK:${this.state.flight.takeoffAcknowledged ? '是' : '否'} · 空中遥测:${this.state.session.telemetry.flight?.airborne === true ? '是' : '否'}`)
             .width('100%').fontSize(12).fontColor('#475467').margin({ top: 8 })
 
-          this.SectionHeader('2 米环绕', this.state.circleObserved ? '已观察执行' : '尚未观察执行')
+          this.SectionHeader({ title: '原生任务', detail: this.state.nativeTask.executionObserved ? '已观察执行' : '尚未观察执行' })
+          Text(`当前任务：${this.state.nativeTask.kind} · 启动回复：${this.state.nativeTask.startReply || '--'} · 停止回复：${this.state.nativeTask.stopReply || '--'}`)
+            .fontSize(12).fontColor('#475467').width('100%')
+          Text(`环绕半径：${this.state.nativeConfig.radiusMeters}米（2–10米）`).width('100%').fontSize(14).margin({ top: 8 })
+          Slider({ value: this.state.nativeConfig.radiusMeters, min: 2, max: 10, step: 1 })
+            .onChange((value: number) => this.controller.setTaskSettings(value, this.state.nativeConfig.framing,
+              this.state.nativeConfig.zoom, this.state.nativeConfig.retreat)).width('100%')
           Row({ space: 8 }) {
             Button('准备/读回').layoutWeight(1).onClick(() => this.controller.prepareCircle())
-            Button('长按启动').layoutWeight(1).backgroundColor('#B54708').enabled(this.state.circlePrepared)
+            Button('长按环绕').layoutWeight(1).backgroundColor('#B54708')
               .gesture(LongPressGesture({ repeat: false, duration: 1500 }).onAction(() => this.controller.startCircleConfirmed()))
             Button('停止').layoutWeight(1).backgroundColor('#B42318').onClick(() => this.controller.stopCircle())
           }.width('100%')
+          Row({ space: 8 }) {
+            Button('准备跟随').layoutWeight(1).onClick(() => this.controller.prepareNative('follow'))
+            Button('长按跟随').layoutWeight(1).backgroundColor('#B54708')
+              .gesture(LongPressGesture({ repeat: false, duration: 1500 }).onAction(() => this.controller.startNativeConfirmed('follow')))
+          }.width('100%').margin({ top: 8 })
+          Text('滑动变焦：先设置景别、倍率及渐远，再准备/启动；跟随和变焦仅从地面启动，每连接一轮。')
+            .width('100%').fontSize(12).fontColor('#667085').margin({ top: 8 })
+          Row({ space: 8 }) {
+            ForEach(['半身', '全身', '远景'], (framing: string) => {
+              Button(framing).layoutWeight(1)
+                .buttonStyle(this.state.nativeConfig.framing === framing ? ButtonStyleMode.EMPHASIZED : ButtonStyleMode.NORMAL)
+                .onClick(() => this.controller.setTaskSettings(this.state.nativeConfig.radiusMeters,
+                  framing as DollyFraming, this.state.nativeConfig.zoom, this.state.nativeConfig.retreat))
+            })
+          }.width('100%')
+          Row({ space: 8 }) {
+            Button(`倍率 1–${this.state.nativeConfig.zoom}倍`).layoutWeight(1).onClick(() => this.controller.setTaskSettings(
+              this.state.nativeConfig.radiusMeters, this.state.nativeConfig.framing,
+              this.state.nativeConfig.zoom === 2 ? 3 : 2, this.state.nativeConfig.retreat))
+            Button(this.state.nativeConfig.retreat ? '渐远：开' : '渐远：关').layoutWeight(1).onClick(() => this.controller.setTaskSettings(
+              this.state.nativeConfig.radiusMeters, this.state.nativeConfig.framing,
+              this.state.nativeConfig.zoom, !this.state.nativeConfig.retreat))
+          }.width('100%').margin({ top: 8 })
+          Row({ space: 8 }) {
+            Button('准备变焦').layoutWeight(1).onClick(() => this.controller.prepareNative('dolly'))
+            Button('长按变焦').layoutWeight(1).backgroundColor('#B54708')
+              .gesture(LongPressGesture({ repeat: false, duration: 1500 }).onAction(() => this.controller.startNativeConfirmed('dolly')))
+          }.width('100%').margin({ top: 8 })
 
-          this.SectionHeader('视频诊断', 'HEVC 预览适配器待真机接入')
+          this.SectionHeader({ title: '视频诊断', detail: 'HEVC 预览适配器待真机接入' })
           Column() {
             Text(this.state.session.videoAgeMs === undefined ? '等待视频码流' : '已接收 HEVC 分片码流')
               .fontSize(16).fontWeight(FontWeight.Medium).fontColor('#344054')
@@ -208,7 +249,7 @@ struct Index {
               .fontSize(12).fontColor('#667085').margin({ top: 6 })
           }.width('100%').height(92).justifyContent(FlexAlign.Center).backgroundColor('#F2F4F7').borderRadius(4)
 
-          this.SectionHeader('相机与媒体', this.state.recordingRequested ? '录像请求已发送' : '相机待机')
+          this.SectionHeader({ title: '相机与媒体', detail: this.state.recordingRequested ? '录像请求已发送' : '相机待机' })
           Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.SpaceBetween }) {
             Button('拍照').width('32%').onClick(() => this.controller.shoot())
             Button('开始录像').width('32%').onClick(() => this.controller.startRecording())
@@ -218,7 +259,7 @@ struct Index {
             Button('下载视频').width('32%').margin({ top: 8 }).onClick(() => this.controller.downloadLatest('video'))
           }.width('100%')
 
-          this.SectionHeader('本地命令', this.state.voice.enabled ? '已启用' : '已禁用')
+          this.SectionHeader({ title: '离线中文语音', detail: this.state.voice.listening ? '连续聆听中' : this.state.voice.enabled ? '已启用' : '已禁用' })
           Row() {
             Text('启用语音/文本动作入口').fontSize(14).fontColor('#344054')
             Blank()
@@ -226,11 +267,15 @@ struct Index {
               .onChange((enabled: boolean) => this.controller.setVoiceEnabled(enabled))
           }.width('100%').height(44)
           Row({ space: 8 }) {
-            Button('开始聆听').layoutWeight(1).enabled(this.state.voice.enabled && !this.state.voice.listening)
+            Button('连续聆听').layoutWeight(1).enabled(this.state.voice.enabled && !this.state.voice.listening)
               .onClick(() => this.controller.startListening())
             Button('停止聆听').layoutWeight(1).enabled(this.state.voice.listening)
               .buttonStyle(ButtonStyleMode.NORMAL).onClick(() => this.controller.stopListening())
           }.width('100%').margin({ bottom: 8 })
+          Text(`最近识别：${this.state.voice.lastTranscript || '暂无'}`).width('100%').fontSize(14).fontColor('#1D2939')
+          Text(this.state.voice.feedback).width('100%').fontSize(13).fontColor('#B54708').margin({ top: 6, bottom: 8 })
+          Text('例如：前进两秒、左转一点、停止、降落、环绕五米、跟随我、滑动变焦、拍照、相册、下载最新录像。启动任务先说口令，再在10秒内说“确认”。')
+            .width('100%').fontSize(12).fontColor('#667085').margin({ bottom: 8 })
           Row({ space: 8 }) {
             TextInput({ text: this.commandText, placeholder: '例如：前进、降落、拍照' }).layoutWeight(1)
               .onChange((value: string) => this.commandText = value)
@@ -239,14 +284,35 @@ struct Index {
           }.width('100%')
           if (this.state.voice.pendingConfirmation.length > 0) {
             Row({ space: 8 }) {
-              Text(this.state.voice.pendingConfirmation === 'takeoff' ? '等待确认：起飞' : '等待确认：启动环绕')
+              Text(`待确认 ${this.state.voice.confirmationRemainingSeconds}秒；请目视确认飞机状态`)
                 .fontColor('#B54708').layoutWeight(1)
               Button('长按确认').backgroundColor('#B54708')
                 .gesture(LongPressGesture({ repeat: false, duration: 1500 }).onAction(() => this.controller.confirmPendingVoice()))
             }.width('100%').margin({ top: 8 })
           }
+          Button(this.showCalibration ? '收起实测标定' : '距离/角度实测标定').buttonStyle(ButtonStyleMode.NORMAL)
+            .onClick(() => this.showCalibration = !this.showCalibration).margin({ top: 8 })
+          if (this.showCalibration) {
+            Text(this.state.calibrationSummary).width('100%').fontSize(12).fontColor('#667085')
+            Text('手动测量同一方向的实际位移（米）或转角（度），输入实际动作秒数。保存只记录标定，不会发送飞行动作。')
+              .width('100%').fontSize(12).fontColor('#667085')
+            Select([{ value: '前进' }, { value: '后退' }, { value: '上升' }, { value: '下降' },
+              { value: '左移' }, { value: '右移' }, { value: '左转' }, { value: '右转' }]).selected(0).value('前进')
+              .onSelect((index: number) => {
+                const directions: MovementDirection[] = ['forward', 'backward', 'up', 'down', 'left', 'right', 'turn_left', 'turn_right'];
+                this.calibrationDirection = directions[index];
+              })
+            Row({ space: 8 }) {
+              TextInput({ text: this.calibrationSeconds, placeholder: '实际动作秒数' }).type(InputType.NUMBER_DECIMAL).layoutWeight(1)
+                .onChange((value: string) => this.calibrationSeconds = value)
+              TextInput({ text: this.calibrationAmount, placeholder: this.calibrationDirection.startsWith('turn_') ? '实测角度（度）' : '实测位移（米）' })
+                .type(InputType.NUMBER_DECIMAL).layoutWeight(1).onChange((value: string) => this.calibrationAmount = value)
+            }.width('100%').margin({ top: 8 })
+            Button('保存实测标定').onClick(() => this.controller.recordCalibration(this.calibrationDirection,
+              Number(this.calibrationSeconds), Number(this.calibrationAmount))).margin({ top: 8 })
+          }
 
-          this.SectionHeader('运行日志', this.state.busy ? '执行中' : this.state.lastOperation)
+          this.SectionHeader({ title: '运行日志', detail: this.state.busy ? '执行中' : this.state.lastOperation })
           if (this.state.lastError.length > 0) {
             Text(`${this.state.lastErrorLayer}: ${this.state.lastError}`).width('100%').fontSize(13)
               .fontColor('#B42318').backgroundColor('#FEF3F2').padding(10).borderRadius(4).margin({ bottom: 8 })

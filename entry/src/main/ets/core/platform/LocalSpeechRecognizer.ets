@@ -1,110 +1,95 @@
 import { abilityAccessCtrl, Context, Permissions } from '@kit.AbilityKit';
 import { speechRecognizer } from '@kit.CoreSpeechKit';
 import { VoiceCommandAdapter } from '../domain/VoiceCommandAdapter';
-
 export type SpeechStatusListener = (message: string) => void;
-
 export class LocalSpeechRecognizer {
   private readonly context: Context;
   private readonly adapter: VoiceCommandAdapter;
   private engine?: speechRecognizer.SpeechRecognitionEngine;
   private sessionId: string = '';
-  private active: boolean = false;
+  private wanted: boolean = false;
+  private generation: number = 0;
+  private restartTimer?: number;
   private statusListener?: SpeechStatusListener;
-
-  constructor(context: Context, adapter: VoiceCommandAdapter) {
-    this.context = context;
-    this.adapter = adapter;
-  }
-
-  setStatusListener(listener?: SpeechStatusListener): void {
-    this.statusListener = listener;
-  }
-
+  constructor(context: Context, adapter: VoiceCommandAdapter) { this.context = context; this.adapter = adapter; }
+  setStatusListener(listener?: SpeechStatusListener): void { this.statusListener = listener; }
   async start(): Promise<void> {
-    if (this.active) return;
-    const permission = 'ohos.permission.MICROPHONE' as Permissions;
-    const result = await abilityAccessCtrl.createAtManager().requestPermissionsFromUser(this.context, [permission]);
-    if (result.authResults.length < 1 || result.authResults[0] !== 0) {
-      throw new Error('Microphone permission was denied');
+    if (this.wanted || !this.adapter.snapshot().enabled) return;
+    this.wanted = true; const generation = ++this.generation;
+    this.adapter.setListening(true); this.emit('正在启动离线中文连续聆听');
+    try {
+      const permission = 'ohos.permission.MICROPHONE' as Permissions;
+      const result = await abilityAccessCtrl.createAtManager().requestPermissionsFromUser(this.context, [permission]);
+      if (!this.current(generation)) return;
+      if (result.authResults.length < 1 || result.authResults[0] !== 0) throw new Error('麦克风权限未允许');
+      await this.startSession(generation);
+    } catch (error) {
+      if (this.current(generation)) { await this.stop(false); throw error instanceof Error ? error : new Error(String(error)); }
     }
-    const engine = await speechRecognizer.createEngine({
-      language: 'zh-CN',
-      online: 1,
-      extraParams: { 'locate': 'CN', 'recognizerMode': 'short' }
-    });
+  }
+  private current(generation: number): boolean {
+    return this.wanted && generation === this.generation && this.adapter.snapshot().enabled;
+  }
+  private async startSession(generation: number): Promise<void> {
+    if (!this.current(generation)) return;
+    const engine = await speechRecognizer.createEngine({ language: 'zh-CN', online: 1,
+      extraParams: { 'locate': 'CN', 'recognizerMode': 'short' } });
+    if (!this.current(generation)) { engine.shutdown(); return; }
+    const sessionId = `neo-${generation}-${Date.now()}`;
+    this.sessionId = sessionId; this.engine = engine;
+    let acceptedFinal: boolean = false;
+    const valid = (id: string): boolean => this.current(generation) && this.engine === engine && id === sessionId;
     engine.setListener({
-      onStart: (_sessionId: string, _eventMessage: string): void => {
-        this.adapter.setListening(true);
-        this.emit('本地识别已开始');
+      onStart: (id: string, _event: string): void => {
+        if (!valid(id)) return;
+        this.adapter.setListening(true); this.emit('离线聆听中；每次说一个口令');
       },
-      onEvent: (_sessionId: string, _eventCode: number, _eventMessage: string): void => {},
-      onResult: (_sessionId: string, recognition: speechRecognizer.SpeechRecognitionResult): void => {
-        if (recognition.isFinal && recognition.result.trim().length > 0) {
-          this.adapter.acceptTranscript(recognition.result);
-          this.emit(`识别: ${recognition.result}`);
-        }
+      onEvent: (_id: string, _code: number, _message: string): void => {},
+      onResult: (id: string, recognition: speechRecognizer.SpeechRecognitionResult): void => {
+        if (!valid(id) || acceptedFinal || !recognition.isFinal || recognition.result.trim().length === 0) return;
+        acceptedFinal = true;
+        this.adapter.acceptTranscript(recognition.result); this.emit(`识别：${recognition.result}`);
       },
-      onComplete: (_sessionId: string, _eventMessage: string): void => {
-        this.active = false;
-        this.adapter.setListening(false);
-        if (this.engine === engine) {
-          this.engine = undefined;
-          engine.shutdown();
-        }
-        this.emit('本地识别已完成');
+      onComplete: (id: string, _message: string): void => {
+        if (!valid(id)) return;
+        this.engine = undefined;
+        try { engine.shutdown(); } catch (_) {}
+        if (!this.current(generation)) return;
+        this.restartTimer = setTimeout(() => {
+          this.restartTimer = undefined;
+          this.startSession(generation).catch((error: Error) => this.fail(generation, error.message));
+        }, 200);
       },
-      onError: (_sessionId: string, errorCode: number, errorMessage: string): void => {
-        this.active = false;
-        this.adapter.setListening(false);
-        if (this.engine === engine) {
-          this.engine = undefined;
-          engine.shutdown();
-        }
-        this.emit(`识别错误 ${errorCode}: ${errorMessage}`);
+      onError: (id: string, code: number, message: string): void => {
+        if (valid(id)) this.fail(generation, `离线识别错误 ${code}：${message}；请重新开始聆听`);
       }
     });
-    this.sessionId = `neo-${Date.now()}`;
-    this.engine = engine;
-    this.active = true;
     try {
-      engine.startListening({
-        sessionId: this.sessionId,
+      engine.startListening({ sessionId: sessionId,
         audioInfo: { audioType: 'pcm', sampleRate: 16000, soundChannel: 1, sampleBit: 16 },
-        extraParams: {
-          'recognitionMode': 0,
-          'vadBegin': 2000,
-          'vadEnd': 3000,
-          'maxAudioDuration': 20000,
-          'srcType': 1,
-          'recognizerOption': { 'enablePartialResult': false }
-        }
-      });
-      this.emit('正在启动本地语音识别');
+        extraParams: { 'recognitionMode': 0, 'vadBegin': 2000, 'vadEnd': 1000, 'maxAudioDuration': 20000,
+          'srcType': 1, 'recognizerOption': { 'enablePartialResult': false } } });
     } catch (error) {
-      this.active = false;
-      this.engine = undefined;
-      engine.shutdown();
+      if (this.engine === engine) this.engine = undefined;
+      try { engine.shutdown(); } catch (_) {}
       throw error instanceof Error ? error : new Error(String(error));
     }
   }
-
-  async stop(finish: boolean = true): Promise<void> {
-    if (!this.active) return;
-    this.active = false;
-    const engine = this.engine;
-    const sessionId = this.sessionId;
-    this.engine = undefined;
-    this.adapter.setListening(false);
+  async stop(finish: boolean = false): Promise<void> {
+    this.wanted = false; this.generation++;
+    if (this.restartTimer !== undefined) { clearTimeout(this.restartTimer); this.restartTimer = undefined; }
+    const engine = this.engine; const id = this.sessionId; this.engine = undefined;
+    this.adapter.setListening(false); this.adapter.cancelPending();
     if (engine !== undefined) {
-      if (finish) engine.finish(sessionId); else engine.cancel(sessionId);
-      engine.shutdown();
+      try { if (finish) engine.finish(id); else engine.cancel(id); }
+      finally { engine.shutdown(); }
     }
-    this.emit('本地语音识别已停止');
+    this.emit('离线聆听已停止');
   }
-
-  private emit(message: string): void {
-    const listener = this.statusListener;
-    if (listener !== undefined) listener(message);
+  private fail(generation: number, message: string): void {
+    if (!this.current(generation)) return;
+    this.stop(false).catch((error: Error) => this.emit(`识别清理：${error.message}`));
+    this.emit(message);
   }
+  private emit(message: string): void { this.statusListener?.(message); }
 }
