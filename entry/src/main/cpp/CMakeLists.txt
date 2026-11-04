@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.5.0)
+project(neovideo LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_library(neovideo SHARED VideoPreview.cpp HevcStream.cpp)
+target_include_directories(neovideo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(neovideo PRIVATE -Wall -Wextra -Werror=return-type)
+target_link_libraries(neovideo PUBLIC libace_napi.z.so libnative_media_vdec.so libnative_media_core.so libnative_media_codecbase.so libnative_window.so libhilog_ndk.z.so)

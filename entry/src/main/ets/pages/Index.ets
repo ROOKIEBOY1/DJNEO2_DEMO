@@ -2,14 +2,22 @@ import { AppRuntime, ConsoleSnapshot } from '../core/domain/AppController';
 import { MovementDirection } from '../core/protocol/StickCodec';
 import { AircraftProfileSummary } from '../core/profile/AircraftProfileStore';
 import { DollyFraming } from '../core/protocol/NativeTaskCodec';
+import { window } from '@kit.ArkUI';
 
 interface HeaderView { title: string; detail: string; }
 interface DiagnosticView { label: string; value: string; }
+
+class VideoSurfaceController extends XComponentController {
+  onSurfaceCreated(surfaceId: string): void { AppRuntime.controller().video.attach(surfaceId); }
+  onSurfaceDestroyed(surfaceId: string): void { AppRuntime.controller().video.detach(surfaceId); }
+}
 
 @Entry
 @Component
 struct Index {
   private controller = AppRuntime.controller();
+  private videoSurface: VideoSurfaceController = new VideoSurfaceController();
+  private desiredScreenOn: boolean = false;
   @State state: ConsoleSnapshot = this.controller.snapshot();
   @State routingJson: string = '';
   @State registrationJson: string = '';
@@ -24,15 +32,29 @@ struct Index {
   @State showCalibration: boolean = false;
 
   aboutToAppear(): void {
-    this.controller.setListener((snapshot: ConsoleSnapshot) => this.state = snapshot);
+    this.controller.setListener((snapshot: ConsoleSnapshot) => {
+      this.state = snapshot;
+      this.keepVideoScreenOn(snapshot.videoPreview.stats.running);
+    });
   }
 
   aboutToDisappear(): void {
+    this.controller.video.detach();
+    this.keepVideoScreenOn(false);
     this.controller.setListener(undefined);
   }
 
   private ageText(age?: number): string {
     return age === undefined ? '--' : `${age} ms`;
+  }
+
+  private keepVideoScreenOn(enabled: boolean): void {
+    if (enabled === this.desiredScreenOn) return;
+    this.desiredScreenOn = enabled;
+    window.getLastWindow(getContext(this)).then((mainWindow: window.Window) => {
+      if (this.desiredScreenOn === enabled) return mainWindow.setWindowKeepScreenOn(enabled);
+      return;
+    }).catch(() => {});
   }
 
   private move(direction: MovementDirection): void {
@@ -241,13 +263,26 @@ struct Index {
               .gesture(LongPressGesture({ repeat: false, duration: 1500 }).onAction(() => this.controller.startNativeConfirmed('dolly')))
           }.width('100%').margin({ top: 8 })
 
-          this.SectionHeader({ title: '视频诊断', detail: 'HEVC 预览适配器待真机接入' })
+          this.SectionHeader({ title: '实时视频', detail: this.state.videoPreview.label })
+          Stack() {
+            XComponent({ id: 'neoVideo', type: XComponentType.SURFACE, controller: this.videoSurface })
+              .width('100%').height('100%')
+            if (this.state.videoPreview.state !== 'live') {
+              Text(this.state.videoPreview.label).fontSize(14).fontColor(Color.White)
+                .padding(12).backgroundColor('#CC101828').borderRadius(6)
+            }
+          }.width('100%')
+            .aspectRatio(this.state.videoPreview.stats.width > 0 && this.state.videoPreview.stats.height > 0 ?
+              this.state.videoPreview.stats.width / this.state.videoPreview.stats.height : 16 / 9)
+            .backgroundColor(Color.Black)
           Column() {
-            Text(this.state.session.videoAgeMs === undefined ? '等待视频码流' : '已接收 HEVC 分片码流')
-              .fontSize(16).fontWeight(FontWeight.Medium).fontColor('#344054')
+            Text(`组帧 ${this.state.videoPreview.stats.assembledFrames} · 解码 ${this.state.videoPreview.stats.decodedFrames} · 送显 ${this.state.videoPreview.stats.renderedFrames}`)
+              .fontSize(12).fontColor('#344054')
+            Text(`积压 ${this.state.videoPreview.stats.queued} · 丢弃 ${this.state.videoPreview.stats.queueDrops} · 解码异常 ${this.state.videoPreview.stats.decodeErrors} · 画面年龄 ${this.ageText(this.state.videoPreview.stats.lastRenderedAgeMs < 0 ? undefined : this.state.videoPreview.stats.lastRenderedAgeMs)}`)
+              .fontSize(12).fontColor('#667085').margin({ top: 4 })
             Text(`待组帧 ${this.state.session.video.pending} · 丢帧 ${this.state.session.video.droppedFrames} · 坏包 ${this.state.session.video.invalidPackets}`)
               .fontSize(12).fontColor('#667085').margin({ top: 6 })
-          }.width('100%').height(92).justifyContent(FlexAlign.Center).backgroundColor('#F2F4F7').borderRadius(4)
+          }.width('100%').padding(8).backgroundColor('#F2F4F7').borderRadius(4)
 
           this.SectionHeader({ title: '相机与媒体', detail: this.state.recordingRequested ? '录像请求已发送' : '相机待机' })
           Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.SpaceBetween }) {

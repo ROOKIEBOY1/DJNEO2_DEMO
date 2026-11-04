@@ -1,6 +1,8 @@
 import { NativeTaskConfig, NativeTaskService, NativeTaskSnapshot } from './NativeTaskService';
 import { DollyFraming, NativeTaskKind } from '../protocol/NativeTaskCodec';
 import { VoiceMotion } from './VoiceMotion';
+import * as nativeVideo from 'libneovideo.so';
+import { VideoPreview, VideoPreviewSnapshot, videoSessionIdentity } from '../media/VideoPreview';
 import { fileIo } from '@kit.CoreFileKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { CameraService } from './CameraService';
@@ -37,11 +39,13 @@ export interface ConsoleSnapshot {
   lastErrorLayer: string;
   lastError: string;
   logs: string[];
+  videoPreview: VideoPreviewSnapshot;
 }
 
 export type ConsoleListener = (snapshot: ConsoleSnapshot) => void;
 
 export class AppController {
+  readonly video: VideoPreview = new VideoPreview(nativeVideo);
   readonly session: DroneSession;
   readonly flight: FlightCommandService;
   readonly nativeTasks: NativeTaskService;
@@ -53,6 +57,8 @@ export class AppController {
   private readonly profiles: AircraftProfileStore;
   private readonly wifi: NeoWifiLink = new NeoWifiLink();
   private listener?: ConsoleListener;
+  private previewTimer?: number;
+  private videoSessionEnabled: boolean = false;
   private busyValue: boolean = false;
   private activeOperations: number = 0;
   private defaultMovementSeconds: number = 0.5;
@@ -82,7 +88,11 @@ export class AppController {
       this.log(message);
       this.emit();
     });
-    this.session.setListener(() => this.emit());
+    this.session.setVideoFrameListener((frame: Uint8Array) => this.video.submit(frame));
+    this.session.setListener((state: DroneSessionSnapshot) => {
+      this.video.setSession(this.videoSessionEnabled ? videoSessionIdentity(state.phase, state.sessionHex) : '');
+      this.emit();
+    });
     this.voice.setListener((command: VoiceCommand) => {
       this.executeVoice(command).catch((error: Error) => this.recordException('语音命令', error));
     });
@@ -92,7 +102,9 @@ export class AppController {
   }
 
   setListener(listener?: ConsoleListener): void {
+    if (this.previewTimer !== undefined) { clearInterval(this.previewTimer); this.previewTimer = undefined; }
     this.listener = listener;
+    if (listener !== undefined) this.previewTimer = setInterval(() => this.emit(), 250);
     this.emit();
   }
 
@@ -120,7 +132,8 @@ export class AppController {
       lastOperation: this.lastOperationValue,
       lastErrorLayer: this.lastErrorLayerValue,
       lastError: this.lastErrorValue,
-      logs: this.logsValue.slice()
+      logs: this.logsValue.slice(),
+      videoPreview: this.video.snapshot()
     };
   }
 
@@ -223,6 +236,7 @@ export class AppController {
           this.wifiProgressValue = message;
           this.emit();
         });
+        this.videoSessionEnabled = true;
         const result = await this.session.connect(runtime, selection);
         if (!result.ok) await this.wifi.leave();
         return result;
@@ -235,6 +249,8 @@ export class AppController {
   async connect(): Promise<void> { await this.connectSelectedAircraft(); }
   async initialize(): Promise<void> { await this.run('初始化', () => this.session.initialize()); }
   async disconnect(): Promise<void> {
+    this.videoSessionEnabled = false;
+    this.video.setSession('');
     this.cancelOperations();
     await this.run('断开', async () => {
       if (this.nativeTasks.activeOrUnknown()) this.recordResult('停止原生任务', await this.nativeTasks.stop());
@@ -388,6 +404,8 @@ export class AppController {
   }
 
   async foregroundOnlySafetyShutdown(): Promise<void> {
+    this.videoSessionEnabled = false;
+    this.video.setSession('');
     const task = this.nativeTasks.snapshot(); this.cancelOperations();
     try {
       await this.speech.stop(false);

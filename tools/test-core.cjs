@@ -6,6 +6,7 @@ const assert = require('node:assert/strict');
 const testApi = require('node:test');
 const originalLoad = Module._load;
 Module._load = function (name, parent, main) {
+  if (name === 'libneovideo.so') return { start() {}, stop() {}, submit() {}, snapshot() { return {}; } };
   if (name === '@ohos/hypium') return {
     describe: testApi.describe, it: (name, level, fn) => testApi.it(name, fn),
     expect: value => ({ assertEqual: expected => assert.equal(value, expected),

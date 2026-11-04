@@ -5,6 +5,8 @@
   "main": "",
   "author": "",
   "license": "",
-  "dependencies": {}
+  "dependencies": {
+    "libneovideo.so": "file:./src/main/cpp/types/libneovideo"
+  }
 }
 
