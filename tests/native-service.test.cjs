@@ -24,6 +24,23 @@ test('dolly selects captured config and waits for idle video mode',async()=>{
   assert.equal((await service.start(false)).ok,false);
   assert.equal((await service.start(true)).ok,true); assert.ok(calls.some(c=>c.p==='010d00'));
 });
+test('airborne dolly requires the prepared task and reselects mode before starting on the matching target', async () => {
+  const { service, state, flight, calls } = rig();
+  assert.equal((await service.prepare('dolly', config)).ok, true);
+  flight.snapshot = () => ({ takeoffSent: true, nativeTaskMayFly: false, movementActive: false });
+  Object.assign(state.flight, { modeRaw: 26, airborne: true, motorsOn: true });
+  state.task.modeRaw = 0;
+  state.subject = { tracking: true, overlay: [{ id: 17 }] };
+  const baseline = calls.length;
+  assert.equal((await service.start(true, undefined, 18)).ok, false);
+  assert.equal(calls.length, baseline);
+  const start = Date.now();
+  assert.equal((await service.start(true, undefined, 17)).ok, true);
+  assert.ok(Date.now() - start >= 5000);
+  assert.equal(calls[baseline].r, 0x17);
+  assert.equal(calls[baseline].i, 0xf9);
+  assert.equal(calls.at(-1).p, '010d00');
+});
 test('airborne or stale task does not prepare follow/dolly',async()=>{
   for(const kind of ['follow','dolly']){ const {service,state,calls}=rig();state.flight.airborne=true;
     assert.equal((await service.prepare(kind,config)).ok,false);assert.equal(calls.length,0);
@@ -79,4 +96,149 @@ test('manual hover mode9 is not an executing follow/circle, but native mode10 re
   assert.equal((await service.prepare('circle',config)).ok,true);
   state.task.modeRaw=10;state.task.payloadHex='050a000100';
   assert.equal((await service.start(true)).ok,false);
+});
+
+test('explicit hover preparation configures follow and dolly without requiring ground preparation', async () => {
+  for (const kind of ['follow', 'dolly']) {
+    const { service, state, flight, calls } = rig();
+    flight.snapshot = () => ({ takeoffSent: true, takeoffAcknowledged: true });
+    Object.assign(state.flight, { airborne: true, motorsOn: true, modeRaw: 6 });
+    state.task.modeRaw = 0;
+    const result = await service.prepareHover(kind, { ...config, zoom: 3 });
+    assert.equal(result.ok, true, result.error?.message);
+    assert.equal(service.snapshot().prepared, true);
+    assert.equal(calls.some(call => call.i === 0x13), false);
+    if (kind === 'dolly') assert.ok(calls.some(call => call.p === 'c59f793d00004040'));
+  }
+});
+
+test('hover preparation rejects stale, landing, unowned, moving or executing states before sending', async () => {
+  for (const change of [
+    f => { f.state.flightAgeMs = 2000; },
+    f => { f.state.taskAgeMs = 2000; },
+    f => { f.flight.snapshot = () => ({ takeoffAcknowledged: true, landRequested: true }); },
+    f => { f.flight.snapshot = () => ({ takeoffAcknowledged: false }); },
+    f => { f.flight.snapshot = () => ({ takeoffAcknowledged: true, movementActive: true }); },
+    f => { f.state.task.modeRaw = 10; f.state.task.phaseRaw = 5; }
+  ]) {
+    const f = rig();
+    Object.assign(f.state.flight, { airborne: true, motorsOn: true, modeRaw: 6 });
+    f.state.task.modeRaw = 0;
+    f.flight.snapshot = () => ({ takeoffAcknowledged: true }); change(f);
+    assert.equal((await f.service.prepareHover('dolly', config)).ok, false);
+    assert.deepEqual(f.calls, []);
+  }
+});
+
+test('independent follow can start on a matching airborne target after explicit hover preparation', async () => {
+  const { service, state, flight, calls } = rig();
+  flight.snapshot = () => ({ takeoffSent: true, takeoffAcknowledged: true });
+  Object.assign(state.flight, { airborne: true, motorsOn: true, modeRaw: 6 }); state.task.modeRaw = 0;
+  assert.equal((await service.prepareHover('follow', config)).ok, true);
+  state.flight.modeRaw = 26; state.subject = {tracking:true,overlay:[{id:17}]};
+  assert.equal((await service.start(true, undefined, 17)).ok, true);
+  assert.equal(calls.at(-1).p, '010a00');
+  assert.equal(calls.filter(call => call.i === 0x13).length, 1);
+  assert.equal(service.snapshot().executionObserved, false);
+});
+
+test('cancelling hover preparation or losing a target during mode settling never sends start', async () => {
+  const f = rig(); const token = new CancellationToken(0);
+  f.flight.snapshot = () => ({takeoffAcknowledged:true,takeoffSent:true});
+  Object.assign(f.state.flight, {airborne:true,motorsOn:true,modeRaw:6}); f.state.task.modeRaw=0;
+  const send = f.session.requestNative;
+  f.session.requestNative = async (...args) => { token.cancel(); return send(...args); };
+  assert.equal((await f.service.prepareHover('dolly', config, token)).ok, false);
+  assert.equal(f.calls.length, 1);
+  const g = rig();
+  g.flight.snapshot = () => ({takeoffAcknowledged:true,takeoffSent:true});
+  Object.assign(g.state.flight, {airborne:true,motorsOn:true,modeRaw:6}); g.state.task.modeRaw=0;
+  await g.service.prepareHover('dolly', config);
+  g.state.flight.modeRaw=26;g.state.subject={tracking:true,overlay:[{id:17}]};
+  const next = g.session.requestNative;
+  g.session.requestNative = async (...args) => { g.state.subject.tracking=false; return next(...args); };
+  assert.equal((await g.service.start(true, undefined, 17)).ok, false);
+  assert.equal(g.calls.some(call => call.i === 0x13), false);
+});
+
+test('a verified new ground cycle clears old task ownership while retaining per-connection usage limits', async () => {
+  const {service,state}=rig();
+  await service.prepare('follow',config);await service.start(true);
+  state.task={phaseRaw:0,modeRaw:9,payloadHex:'0509000100',observedAtMs:Date.now()+1};
+  assert.equal(service.activeOrUnknown(),true);
+  service.resetAfterGroundedCycle();
+  assert.equal(service.activeOrUnknown(),false);
+  assert.equal(service.snapshot().startedAtMs,undefined);
+  assert.equal((await service.prepare('follow',config)).error.code,'NATIVE_CYCLE_USED');
+});
+
+test('native progress records transitions and distinguishes accepted start from observed execution', async () => {
+  const {service,state}=rig();
+  assert.equal(service.observeProgress(),undefined);
+  await service.prepare('follow',config);await service.start(true);
+  state.task.observedAtMs=Date.now()+1;state.camera.observedAtMs=Date.now()+1;
+  assert.match(service.observeProgress(),/执行已观察=false/);
+  assert.equal(service.observeProgress(),undefined);
+  state.task.payloadHex='050a000100';
+  state.camera.recordingCandidate=true;
+  assert.match(service.observeProgress(),/执行已观察=true.*录像已观察=true/);
+  state.task.payloadHex='0000000101';state.camera.recordingCandidate=false;
+  assert.match(service.observeProgress(),/0000000101.*录像=false.*执行已观察=true/);
+  assert.equal(service.observeProgress(),undefined);
+});
+
+test('dolly can prepare again in the same connection after a verified new grounded cycle', async () => {
+  const {service,state}=rig();
+  assert.equal((await service.prepare('dolly',config)).ok,true);
+  assert.equal((await service.start(true)).ok,true);
+  assert.equal((await service.prepare('dolly',config)).ok,false,'an executing or unknown task must remain locked');
+  state.task.observedAtMs=Date.now()+1;
+  service.resetAfterGroundedCycle();
+  const repeated=await service.prepare('dolly',{...config,zoom:3});
+  assert.equal(repeated.ok,true,repeated.error?.message);
+  assert.equal(service.snapshot().config.zoom,3);
+});
+
+test('an observed completed dolly hands off hover ownership and can prepare a second shot without landing', async () => {
+  const {service,state,flight}=rig();const now=Date.now();let mayFly=true;
+  await service.prepare('dolly',config);await service.start(true);
+  state.task={phaseRaw:5,modeRaw:13,payloadHex:'050d000100',observedAtMs:now+10};
+  Object.assign(state.camera,{observedAtMs:now+10,recordingCandidate:true});service.observeProgress();
+  Object.assign(state.flight,{modeRaw:6,airborne:true,motorsOn:true,observedAtMs:now+20});
+  state.task={phaseRaw:0,modeRaw:0,payloadHex:'0000000100',observedAtMs:now+20};
+  Object.assign(state.camera,{observedAtMs:now+20,recordingCandidate:false});
+  flight.snapshot=()=>({takeoffSent:true,takeoffAcknowledged:true,nativeTaskMayFly:mayFly});
+  flight.releaseNativeTaskAfterHover=()=>{mayFly=false;return {ok:true,data:true};};
+  assert.equal(service.completeForHover().ok,true);
+  assert.equal(service.snapshot().startedAtMs,undefined);
+  assert.equal((await service.prepareHover('dolly',{...config,zoom:3})).ok,true);
+});
+
+test('a start ACK without observed execution cannot unlock another airborne shot', async () => {
+  const {service,state,flight}=rig();let released=false;
+  await service.prepare('dolly',config);await service.start(true);
+  state.task.observedAtMs=Date.now()+1;state.camera.observedAtMs=Date.now()+1;
+  flight.releaseNativeTaskAfterHover=()=>{released=true;return {ok:true,data:true};};
+  assert.equal(service.completeForHover().ok,false);
+  assert.equal(released,false);
+});
+
+test('a verified completion can hand off through the ordinary mode9 hover reached after releasing tracking', async () => {
+  const {service,state,session}=rig();
+  await service.prepare('dolly',config);await service.start(true);
+  const started=service.snapshot().startedAtMs;
+  state.task={phaseRaw:5,modeRaw:13,payloadHex:'050d000100',observedAtMs:started+10};
+  state.camera.observedAtMs=started+10;service.observeProgress();
+  state.task={phaseRaw:0,modeRaw:0,payloadHex:'0000000102',observedAtMs:started+20};
+  state.camera.observedAtMs=started+20;
+  assert.equal(service.canCompleteForHover().ok,true);
+  const {FlightCommandService}=require('../entry/src/main/ets/core/domain/FlightCommandService.ets');
+  const flight=new FlightCommandService(session);flight.takeoffSentValue=true;flight.takeoffAcknowledgedValue=true;
+  flight.markNativeTaskMayFly(started);service.flight=flight;
+  Object.assign(state.flight,{modeRaw:6,airborne:true,motorsOn:true,observedAtMs:started+30});
+  state.task={phaseRaw:5,modeRaw:9,payloadHex:'0509000100',observedAtMs:started+30};
+  state.camera.observedAtMs=started+30;
+  assert.equal(service.completeForHover().ok,true);
+  assert.equal(flight.snapshot().nativeTaskMayFly,false);
+  assert.equal(service.snapshot().startedAtMs,undefined);
 });

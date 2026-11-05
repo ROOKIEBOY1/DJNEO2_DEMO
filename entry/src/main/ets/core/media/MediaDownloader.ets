@@ -127,15 +127,21 @@ async function requestBound(selection: DroneWifiSelection, target: string, range
     resolveResponse = resolve;
     rejectResponse = reject;
   });
-  let timer: number = 0;
+  let timer: number | undefined;
+  const clearIdleTimeout = (): void => {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+  };
   const armIdleTimeout = (): void => {
-    clearTimeout(timer);
+    clearIdleTimeout();
     timer = setTimeout(() => finishError(new Error('Media HTTP request timed out after 5 seconds without data')), 5000);
   };
   const finishError = (error: Error): void => {
     if (!completed) {
       completed = true;
-      clearTimeout(timer);
+      clearIdleTimeout();
       rejectResponse(error);
     }
   };
@@ -180,7 +186,7 @@ async function requestBound(selection: DroneWifiSelection, target: string, range
         }
         if (bodyBytes === expectedTotal) {
           completed = true;
-          clearTimeout(timer);
+          clearIdleTimeout();
           resolveResponse({
             status: parsedHeader.status,
             headers: parsedHeader.headers,
@@ -213,7 +219,7 @@ async function requestBound(selection: DroneWifiSelection, target: string, range
     await tcp.send({ data: request, encoding: 'UTF-8' });
     return await responsePromise;
   } finally {
-    clearTimeout(timer);
+    clearIdleTimeout();
     tcp.off('message');
     tcp.off('error');
     tcp.off('close');

@@ -81,6 +81,14 @@ export class MediaRepository {
     if (entry === undefined) {
       return failure(ErrorLayer.TASK, 'MEDIA_NOT_FOUND', 'No matching original exists in the aircraft directory');
     }
+    return this.downloadEntry(entry, outputDirectory, token);
+  }
+
+  async downloadEntry(entry: MediaEntry, outputDirectory: string,
+    token?: CancellationToken): Promise<OperationResult<MediaDownloadResult>> {
+    if (token?.isCancelled() || !this.session.isReliableLinkFresh()) {
+      return failure(ErrorLayer.NETWORK, 'LINK_NOT_FRESH', '下载需要当前飞机的有效连接');
+    }
     const selection = this.session.networkSelection();
     if (selection === undefined) {
       return failure(ErrorLayer.NETWORK, 'AIRCRAFT_NETWORK_MISSING', 'Aircraft Wi-Fi selection is unavailable');

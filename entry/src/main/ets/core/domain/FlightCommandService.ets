@@ -225,6 +225,30 @@ export class FlightCommandService {
     this.nativeStopConfirmedAtValue = confirmedAtMs;
   }
 
+  releaseNativeTaskAfterHover(completionObservedAtMs?: number): OperationResult<boolean> {
+    if (!this.nativeTaskMayFlyValue) return success(true);
+    const telemetry = this.session.snapshot().telemetry;
+    const flight = telemetry.flight; const task = telemetry.task; const camera = telemetry.camera;
+    const startedAt = this.nativeStartedAtValue;
+    const manualAfterCompletion = startedAt !== undefined && completionObservedAtMs !== undefined &&
+      completionObservedAtMs >= startedAt && task !== undefined && flight !== undefined && camera !== undefined &&
+      task.modeRaw === 9 && [0, 5].includes(task.phaseRaw) && task.observedAtMs >= completionObservedAtMs &&
+      flight.observedAtMs >= completionObservedAtMs && camera.observedAtMs >= completionObservedAtMs;
+    if (startedAt === undefined || !this.takeoffSentValue || !this.takeoffAcknowledgedValue ||
+      this.landRequestedValue || this.landSentValue || this.movementActiveValue || !this.session.isActionLinkFresh() ||
+      (telemetry.flightAgeMs ?? Infinity) > 1000 || (telemetry.taskAgeMs ?? Infinity) > 1000 ||
+      (telemetry.cameraAgeMs ?? Infinity) > 1000 || flight === undefined || task === undefined || camera === undefined ||
+      flight.observedAtMs < startedAt || task.observedAtMs < startedAt || camera.observedAtMs < startedAt ||
+      flight.modeRaw !== 6 || !flight.airborne || !flight.motorsOn || camera.recordingCandidate !== false ||
+      (!['0000000100', '0000000101', '0000000102', '0300000100', '0400000100'].includes(task.payloadHex) &&
+        !manualAfterCompletion)) {
+      return failure(ErrorLayer.TASK, 'NATIVE_HOVER_HANDOFF_REQUIRED', '请等待上一任务结束、相机空闲并恢复普通悬停后再拍摄');
+    }
+    this.nativeTaskMayFlyValue = false;
+    this.nativeStartedAtValue = undefined; this.nativeStopConfirmedAtValue = undefined;
+    return success(true);
+  }
+
   async foregroundOnlySafetyShutdown(): Promise<OperationResult<boolean>> {
     this.activeToken.cancel();
     await this.centerSticks();

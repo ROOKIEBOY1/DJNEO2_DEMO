@@ -21,6 +21,7 @@ export interface VideoPreviewStats {
 
 export interface VideoPreviewBackend {
   start(surfaceId: string): void;
+  switchSurface?(surfaceId: string): boolean;
   stop(): void;
   submit(bytes: ArrayBuffer): void;
   snapshot(): VideoPreviewStats;
@@ -54,6 +55,10 @@ export class VideoPreview {
 
   attach(surfaceId: string): void {
     if (surfaceId === this.surfaceId) return;
+    if (this.active && this.backend.switchSurface?.(surfaceId) === true) {
+      this.surfaceId = surfaceId;
+      return;
+    }
     this.stop(); this.surfaceId = surfaceId; this.start();
   }
 

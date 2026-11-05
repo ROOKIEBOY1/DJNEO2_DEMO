@@ -26,19 +26,86 @@ export class NativeTaskService {
   private used: NativeTaskKind[] = [];
   private token?: CancellationToken;
   private generation: number = 0;
+  private preparingHover: boolean = false;
+  private lastProgress: string = '';
+  private executionSeen: boolean = false;
+  private recordingSeen: boolean = false;
+  private hoverCompletionAtMs?: number;
   constructor(session: DroneSession, flight: FlightCommandService, camera: CameraService) {
     this.session = session; this.flight = flight; this.camera = camera;
   }
   resetForAircraftSession(): void {
+    this.resetAfterGroundedCycle(); this.used = [];
+  }
+  // Called only after FlightCommandService has verified fresh post-cycle grounded telemetry.
+  resetAfterGroundedCycle(): void {
+    this.resetTaskState();
+  }
+  private resetTaskState(): void {
     this.cancel(); this.generation++; this.startedAt = undefined;
-    this.startReply = ''; this.stopReply = ''; this.used = [];
+    this.startReply = ''; this.stopReply = '';
+    this.lastProgress = ''; this.executionSeen = false; this.recordingSeen = false;
+    this.hoverCompletionAtMs = undefined;
+  }
+
+  canCompleteForHover(): OperationResult<boolean> {
+    if (this.busy || this.startedAt === undefined || (!this.executionSeen && !this.recordingSeen && this.stopReply !== '00')) {
+      return failure(ErrorLayer.TASK, 'NATIVE_COMPLETION_UNOBSERVED', '尚未确认上一轮实际执行或停止，不能重复拍摄');
+    }
+    const telemetry = this.session.snapshot().telemetry;
+    const terminal = telemetry.task !== undefined &&
+      ['0000000100', '0000000101', '0000000102', '0300000100', '0400000100'].includes(telemetry.task.payloadHex);
+    const manualAfterCompletion = this.hoverCompletionAtMs !== undefined && telemetry.task !== undefined &&
+      telemetry.task.modeRaw === 9 && [0, 5].includes(telemetry.task.phaseRaw) &&
+      telemetry.task.observedAtMs >= this.hoverCompletionAtMs;
+    if ((telemetry.taskAgeMs ?? Infinity) > 1000 || (telemetry.cameraAgeMs ?? Infinity) > 1000 ||
+      telemetry.camera === undefined || telemetry.camera.recordingCandidate !== false ||
+      telemetry.camera.observedAtMs < this.startedAt || telemetry.task === undefined ||
+      telemetry.task.observedAtMs < this.startedAt ||
+      (!terminal && !manualAfterCompletion)) {
+      this.hoverCompletionAtMs = undefined;
+      return failure(ErrorLayer.TASK, 'NATIVE_NOT_COMPLETED', '上一轮任务仍在执行或结束状态已过期');
+    }
+    if (terminal) this.hoverCompletionAtMs = telemetry.task.observedAtMs;
+    return success(true);
+  }
+  completeForHover(): OperationResult<boolean> {
+    const completed = this.canCompleteForHover();
+    if (!completed.ok) return completed;
+    const handoff = this.flight.releaseNativeTaskAfterHover(this.hoverCompletionAtMs);
+    if (!handoff.ok) return handoff;
+    this.resetTaskState();
+    return success(true);
+  }
+  observeProgress(): string | undefined {
+    if (this.startedAt === undefined) return undefined;
+    const telemetry = this.session.snapshot().telemetry;
+    const task = telemetry.task;
+    const camera = telemetry.camera;
+    const taskFresh = task !== undefined && (telemetry.taskAgeMs ?? Infinity) <= 1000 && task.observedAtMs >= this.startedAt;
+    const cameraFresh = camera !== undefined && (telemetry.cameraAgeMs ?? Infinity) <= 1000 && camera.observedAtMs >= this.startedAt;
+    const expected = this.kind === 'circle' ? '0505000100' : this.kind === 'follow' ? '050a000100' : '050d000100';
+    if (taskFresh && task?.payloadHex === expected) this.executionSeen = true;
+    if (cameraFresh && camera?.recordingCandidate === true) this.recordingSeen = true;
+    const flight = this.flight.snapshot();
+    const message = `原生${this.kind}状态：任务=${taskFresh ? task?.payloadHex : '未收到新鲜状态'}，` +
+      `飞行模式=${(telemetry.flightAgeMs ?? Infinity) <= 1000 ? telemetry.flight?.modeRaw : '过期'}，` +
+      `录像=${cameraFresh ? camera?.recordingCandidate : '未收到新鲜状态'}，` +
+      `执行已观察=${this.executionSeen}，录像已观察=${this.recordingSeen}，` +
+      `跟踪=${telemetry.subject?.tracking === true}，目标=${telemetry.subject?.overlay[0]?.id ?? '无'}，` +
+      `降落中=${flight.landRequested === true || flight.landSent === true}`;
+    if (message === this.lastProgress) return undefined;
+    this.lastProgress = message;
+    return message;
   }
   cancel(): void { this.token?.cancel(); this.prepared = false; }
   activeOrUnknown(): boolean {
     if (this.startedAt === undefined) return false;
     const telemetry = this.session.snapshot().telemetry; const task = telemetry.task;
     return !(task !== undefined && telemetry.taskAgeMs !== undefined && telemetry.taskAgeMs <= 1000 &&
-      task.observedAtMs > this.startedAt && ['0000000101', '0000000102', '0400000100', '0300000100'].includes(task.payloadHex));
+      task.observedAtMs > this.startedAt &&
+      (['0000000101', '0000000102', '0400000100', '0300000100'].includes(task.payloadHex) ||
+        (task.payloadHex === '0000000100' && (this.executionSeen || this.recordingSeen || this.stopReply === '00'))));
   }
   snapshot(): NativeTaskSnapshot {
     const telemetry = this.session.snapshot().telemetry; const task = telemetry.task;
@@ -50,11 +117,16 @@ export class NativeTaskService {
       config: { radiusMeters: this.config.radiusMeters, framing: this.config.framing, zoom: this.config.zoom, retreat: this.config.retreat },
       startReply: this.startReply, stopReply: this.stopReply };
   }
-  async prepare(kind: NativeTaskKind, config: NativeTaskConfig, external?: CancellationToken): Promise<OperationResult<boolean>> {
+  async prepareHover(kind: NativeTaskKind, config: NativeTaskConfig, external?: CancellationToken): Promise<OperationResult<boolean>> {
+    return this.prepare(kind, config, external, true);
+  }
+  async prepare(kind: NativeTaskKind, config: NativeTaskConfig, external?: CancellationToken,
+    fromHover: boolean = false): Promise<OperationResult<boolean>> {
     if (this.busy || this.activeOrUnknown()) return failure(ErrorLayer.TASK, 'NATIVE_BUSY', '上一原生任务尚未确认结束');
-    if (kind !== 'circle' && this.used.includes(kind)) return failure(ErrorLayer.TASK, 'NATIVE_CYCLE_USED', '本连接已启动过此任务，落地后重新连接');
+    if (kind === 'follow' && this.used.includes(kind)) return failure(ErrorLayer.TASK, 'NATIVE_CYCLE_USED', '本连接已启动过跟随任务，落地后重新连接');
     const token = new CancellationToken(this.generation); this.token = token; this.prepared = false; this.busy = true;
     this.kind = kind;
+    this.preparingHover = fromHover;
     this.config = { radiusMeters: config.radiusMeters, framing: config.framing, zoom: config.zoom, retreat: config.retreat };
     try {
       validateCircleRadius(config.radiusMeters); dollyParameterWrites(config.framing, config.zoom, config.retreat);
@@ -78,17 +150,35 @@ export class NativeTaskService {
       }
       this.ensureReady(token, external); this.prepared = true; return success(true);
     } catch (error) { return failure(ErrorLayer.TASK, 'NATIVE_PREPARE_FAILED', message(error)); }
-    finally { this.busy = false; }
+    finally { this.preparingHover = false; this.busy = false; }
   }
-  async start(confirmed: boolean, external?: CancellationToken): Promise<OperationResult<string>> {
+  async start(confirmed: boolean, external?: CancellationToken, selectedTarget?: number): Promise<OperationResult<string>> {
     if (!confirmed || !this.prepared || this.busy || this.activeOrUnknown()) return failure(ErrorLayer.TASK, 'NATIVE_NOT_PREPARED', '需要准备任务并独立确认启动');
     const token = this.token;
     if (token === undefined) return failure(ErrorLayer.TASK, 'NATIVE_CANCELLED', '任务已取消');
     this.busy = true;
     try {
-      this.ensureReady(token, external);
+      this.ensureReady(token, external, selectedTarget);
       if (this.kind === 'dolly') this.ensureVideoMode();
+      if (selectedTarget !== undefined) {
+        const selection = nativeSelection(this.kind);
+        validateNativeRequest(this.kind, 0x17, 3, 0xf9, selection);
+        const reply = await this.session.requestNative(0x17, 3, 0xf9, selection, 2000, token);
+        if (reply === undefined || !bytesEqual(reply, concatBytes(new Uint8Array([0]), selection))) {
+          throw new Error('空中任务模式切换未收到匹配回显');
+        }
+        const settleUntil = Date.now() + 5000;
+        while (Date.now() < settleUntil) {
+          this.ensureReady(token, external, selectedTarget);
+          await new Promise<void>((resolve: () => void) => setTimeout(resolve, 100));
+        }
+        this.ensureReady(token, external, selectedTarget);
+        if (this.kind === 'dolly') this.ensureVideoMode();
+      }
       this.prepared = false; this.startedAt = Date.now(); this.used.push(this.kind);
+      this.lastProgress = ''; this.executionSeen = false; this.recordingSeen = false;
+      this.hoverCompletionAtMs = undefined;
+      this.stopReply = '';
       // An unanswered start may already have taken off; keep the conservative flight lock.
       this.flight.markNativeTaskMayFly(this.startedAt);
       validateNativeRequest(this.kind, 0x92, 0x23, 0x13, nativeStart(this.kind));
@@ -110,13 +200,35 @@ export class NativeTaskService {
       this.flight.markNativeStopConfirmed(Date.now()); return success('停止请求已获回复；需观察悬停/落地状态');
     } catch (error) { return failure(ErrorLayer.TASK, 'NATIVE_STOP_UNCONFIRMED', message(error)); }
   }
-  private ensureReady(token: CancellationToken, external?: CancellationToken): void {
+  private ensureReady(token: CancellationToken, external?: CancellationToken, selectedTarget?: number): void {
     if (token.isCancelled() || external?.isCancelled() || token.generation() !== this.generation) throw new Error('原生任务操作已取消');
     const flight = this.flight.snapshot();
     if (flight.landRequested || flight.landSent) throw new Error('本轮已请求降落，不能启动原生任务');
     if (!this.session.isActionLinkFresh()) throw new Error('设备、下行或视频状态不新鲜');
     const observed = this.session.snapshot().telemetry;
     const taskFresh = observed.task !== undefined && observed.taskAgeMs !== undefined && observed.taskAgeMs <= 1000;
+    if (this.preparingHover) {
+      if (!flight.takeoffAcknowledged || flight.nativeTaskMayFly || flight.movementActive ||
+        (observed.flightAgeMs ?? Infinity) > 1000 || observed.flight?.modeRaw !== 6 ||
+        !observed.flight.airborne || !observed.flight.motorsOn || observed.subject?.tracking === true ||
+        !taskFresh || observed.task === undefined || !((observed.task.phaseRaw === 0 && observed.task.modeRaw === 0) ||
+          (observed.task.modeRaw === 9 && [0, 5].includes(observed.task.phaseRaw))) ||
+        (observed.cameraAgeMs ?? Infinity) > 1000 || observed.camera?.recordingCandidate !== false) {
+        throw new Error('空中准备需要本轮普通起飞后的新鲜悬停、任务空闲及相机空闲状态');
+      }
+      return;
+    }
+    if (selectedTarget !== undefined) {
+      const subject = observed.subject;
+      if (!['dolly', 'follow'].includes(this.kind) || !flight.takeoffSent || flight.nativeTaskMayFly || flight.movementActive ||
+        !taskFresh || observed.task?.phaseRaw !== 0 || observed.task?.modeRaw !== 0 ||
+        (observed.flightAgeMs ?? Infinity) > 1000 || observed.flight?.modeRaw !== 26 ||
+        !observed.flight.airborne || !observed.flight.motorsOn || subject?.tracking !== true ||
+        subject.overlay.length !== 1 || subject.overlay[0].id !== selectedTarget) {
+        throw new Error('空中任务需要新鲜的飞机跟踪框、普通起飞和空闲任务状态');
+      }
+      return;
+    }
     const terminal = taskFresh && observed.task !== undefined && ['0400000100', '0300000100'].includes(observed.task.payloadHex);
     const ownManualHover = this.kind === 'circle' && flight.takeoffAcknowledged && !flight.nativeTaskMayFly &&
       observed.flight !== undefined && observed.flightAgeMs !== undefined && observed.flightAgeMs <= 1000 &&

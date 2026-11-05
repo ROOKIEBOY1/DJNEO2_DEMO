@@ -19,6 +19,15 @@ export interface VideoPreviewStats {
   lastError: string;
 }
 export const start: (surfaceId: string) => void;
+export const switchSurface: (surfaceId: string) => boolean;
 export const stop: () => void;
 export const submit: (bytes: ArrayBuffer) => void;
 export const snapshot: () => VideoPreviewStats;
+export interface DecodedFrame {
+  rgba: ArrayBuffer;
+  width: number;
+  height: number;
+  capturedAtMs: number;
+}
+export const requestFrame: () => number;
+export const takeFrame: (ticket: number) => DecodedFrame | undefined;

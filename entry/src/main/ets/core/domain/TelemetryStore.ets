@@ -1,5 +1,6 @@
 import { toHex } from '../protocol/Bytes';
 import { decodeDumlFrame, DumlFrame } from '../protocol/DumlCodec';
+import { SubjectObservation, SubjectSnapshot } from './SubjectObservation';
 
 export interface FlightTelemetry {
   observedAtMs: number;
@@ -27,6 +28,7 @@ export interface CameraTelemetry {
 }
 
 export interface TelemetrySnapshot {
+  subject?: SubjectSnapshot;
   flight?: FlightTelemetry;
   flightAgeMs?: number;
   task?: TaskTelemetry;
@@ -36,6 +38,9 @@ export interface TelemetrySnapshot {
 }
 
 export class TelemetryStore {
+  private subject: SubjectObservation = new SubjectObservation();
+
+  clearSubject(): void { this.subject = new SubjectObservation(); }
   private flight?: FlightTelemetry;
   private task?: TaskTelemetry;
   private camera?: CameraTelemetry;
@@ -47,6 +52,7 @@ export class TelemetryStore {
     } catch (_) {
       return;
     }
+    this.subject.observe(frame, observedAtMs);
     if (frame.sender === 3 && frame.commandSet === 3 && frame.commandId === 0x43 &&
       frame.payload.length >= 36) {
       const view = new DataView(frame.payload.buffer, frame.payload.byteOffset, frame.payload.byteLength);
@@ -85,7 +91,7 @@ export class TelemetryStore {
   }
 
   snapshot(nowMs: number = Date.now()): TelemetrySnapshot {
-    const result: TelemetrySnapshot = {};
+    const result: TelemetrySnapshot = { subject: this.subject.snapshot(nowMs) };
     if (this.flight !== undefined) {
       result.flight = this.flight;
       result.flightAgeMs = Math.max(0, nowMs - this.flight.observedAtMs);

@@ -290,6 +290,8 @@ export class DroneSession {
       snapshot.videoAgeMs !== undefined && snapshot.videoAgeMs <= 1000;
   }
 
+  clearSubjectObservation(): void { this.telemetry.clearSubject(); }
+
   isReliableLinkFresh(): boolean {
     const snapshot = this.snapshot();
     return snapshot.phase === SessionPhase.READY && snapshot.deviceVerified &&
@@ -630,6 +632,7 @@ export class DroneSession {
   }
 
   private async cleanup(): Promise<void> {
+    this.telemetry.clearSubject();
     if (this.tickTimer !== undefined) {
       clearInterval(this.tickTimer);
       this.tickTimer = undefined;

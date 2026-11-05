@@ -9,6 +9,17 @@ delete require.cache[require.resolve('../entry/src/main/ets/core/platform/LocalS
 const {LocalSpeechRecognizer}=require('../entry/src/main/ets/core/platform/LocalSpeechRecognizer.ets');
 function engine(){return {starts:0,shutdowns:0,setListener(l){this.listener=l;},startListening(p){this.starts++;this.session=p.sessionId;},
   cancel(){},finish(){},shutdown(){this.shutdowns++;}};}
+test('one-shot speech returns text without dispatching flight commands',async()=>{
+  api.permission=async()=>({authResults:[0]});const e=engine();api.create=async()=>e;
+  const adapter=new VoiceCommandAdapter();adapter.setEnabled(true);const sent=[];adapter.setListener(c=>sent.push(c.kind));
+  const speech=new LocalSpeechRecognizer({},adapter);
+  const result=speech.listenOnce();
+  await new Promise(resolve=>setImmediate(resolve));
+  e.listener.onResult(e.session,{isFinal:true,result:'拍照'});
+  assert.equal(await result,'拍照');
+  assert.deepEqual(sent,[]);
+  assert.equal(e.shutdowns,1);
+});
 test('stopping during permission prompt suppresses later engine creation',async()=>{
   let resolve;let created=0;api.permission=()=>new Promise(r=>resolve=r);api.create=async()=>{created++;return engine();};
   const adapter=new VoiceCommandAdapter();adapter.setEnabled(true);const speech=new LocalSpeechRecognizer({},adapter);

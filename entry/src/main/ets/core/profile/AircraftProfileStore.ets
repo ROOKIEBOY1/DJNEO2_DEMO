@@ -51,7 +51,7 @@ export class AircraftProfileStore {
     } else {
       const builtIn = builtInRegistrationProfile();
       const first: AircraftProfileRecord = {
-        id: createLocalId(), displayName: 'Neo 2 12AD', ssid: 'DJI-NEO2-12AD', password: '',
+        id: createLocalId(), displayName: '未配置飞机', ssid: '', password: '',
         registrationKind: 'built_in', registrationJson: '', registrationProfileId: builtIn.profileId,
         routingIdentity: builtIn.routingIdentity
       };

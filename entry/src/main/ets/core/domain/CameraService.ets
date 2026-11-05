@@ -7,6 +7,8 @@ import { MediaDownloadResult } from '../media/MediaDownloader';
 import { MediaKind } from '../media/MediaDirectory';
 import { CancellationToken, ErrorLayer, failure, OperationResult, success } from './OperationResult';
 import { DroneSession } from './DroneSession';
+import { TelemetrySnapshot } from './TelemetryStore';
+import { hilog } from '@kit.PerformanceAnalysisKit';
 
 export interface CameraSnapshot {
   operationActive: boolean;
@@ -20,6 +22,8 @@ export class CameraService {
   private operationActive: boolean = false;
   private recordingRequested: boolean = false;
   private recordingAttemptAtMs?: number;
+  private recordingObservedAtMs?: number;
+  private recordingIdleSinceMs?: number;
 
   constructor(session: DroneSession, media: MediaRepository) {
     this.session = session;
@@ -38,6 +42,45 @@ export class CameraService {
     this.operationActive = false;
     this.recordingRequested = false;
     this.recordingAttemptAtMs = undefined;
+    this.recordingObservedAtMs = undefined;
+    this.recordingIdleSinceMs = undefined;
+  }
+
+  observeTelemetry(telemetry: TelemetrySnapshot): void {
+    const camera = telemetry.camera;
+    if (!this.recordingRequested || this.recordingAttemptAtMs === undefined) return;
+    if (camera === undefined || (telemetry.cameraAgeMs ?? Infinity) > 1000 ||
+      camera.observedAtMs < this.recordingAttemptAtMs) {
+      this.recordingIdleSinceMs = undefined;
+      return;
+    }
+    if (camera.recordingCandidate) {
+      this.recordingObservedAtMs = camera.observedAtMs;
+      this.recordingIdleSinceMs = undefined;
+    } else if (this.recordingObservedAtMs !== undefined && camera.observedAtMs > this.recordingObservedAtMs) {
+      this.recordingIdleSinceMs = this.recordingIdleSinceMs ?? camera.observedAtMs;
+      if (!this.operationActive && camera.observedAtMs - this.recordingIdleSinceMs >= 500) {
+        this.releaseRecordingLock('已观察到本次录像结束并保持空闲');
+      }
+    }
+  }
+
+  resetAfterGroundedCycle(): void {
+    const telemetry = this.session.snapshot().telemetry;
+    const camera = telemetry.camera;
+    const flight = telemetry.flight;
+    if (!this.recordingRequested || this.operationActive || this.recordingAttemptAtMs === undefined ||
+      (telemetry.cameraAgeMs ?? Infinity) > 1000 || (telemetry.flightAgeMs ?? Infinity) > 1000 ||
+      camera === undefined || flight === undefined || camera.recordingCandidate !== false ||
+      flight.airborne !== false || flight.motorsOn !== false || flight.observedAtMs < this.recordingAttemptAtMs ||
+      camera.observedAtMs < this.recordingAttemptAtMs + 1500) return;
+    this.releaseRecordingLock('重飞前已确认落地停桨及相机空闲');
+  }
+
+  private releaseRecordingLock(reason: string): void {
+    this.recordingRequested = false;
+    this.recordingObservedAtMs = undefined; this.recordingIdleSinceMs = undefined;
+    hilog.info(0, 'NeoCamera', '%{public}s，本地录像锁已释放', reason);
   }
 
   async shoot(token?: CancellationToken): Promise<OperationResult<string>> {
@@ -61,15 +104,8 @@ export class CameraService {
       const sentAt = Date.now();
       const reply = await this.session.requestNative(1, 2, 0xff, VIDEO_MODE, 2000, token);
       if (!successReply(reply)) throw new Error('相机录像模式设置未获成功回复');
-      const deadline = Date.now() + 2000;
-      while (Date.now() < deadline) {
-        this.ensureNotCancelled(token); this.ensureFresh(); this.requireIdle();
-        const telemetry = this.session.snapshot().telemetry;
-        if (telemetry.camera !== undefined && telemetry.camera.observedAtMs >= sentAt &&
-          telemetry.camera.modeRaw === 1 && telemetry.camera.timeSynchronized) return success('录像模式已观察确认');
-        await delay(50);
-      }
-      throw new Error('未观察到新的录像模式状态，未启动任务');
+      await this.waitCameraMode(1, sentAt, token);
+      return success('录像模式已观察确认');
     } catch (error) { return failure(ErrorLayer.TASK, 'VIDEO_MODE_NOT_OBSERVED', errorMessage(error)); }
     finally { this.operationActive = false; }
   }
@@ -82,8 +118,10 @@ export class CameraService {
       const reply = await this.session.requestNative(1, 2, 2, payload);
       if (successReply(reply)) {
         this.recordingRequested = false;
+        return success(toHex(reply as Uint8Array));
       }
-      return success(reply === undefined ? 'no_reply' : toHex(reply));
+      return failure(ErrorLayer.COMMAND, 'CAMERA_STOP_UNCONFIRMED',
+        `停止录像未获成功回复：${replyDescription(reply)}`);
     } catch (error) {
       return failure(ErrorLayer.COMMAND, 'CAMERA_STOP_FAILED', errorMessage(error));
     }
@@ -110,6 +148,7 @@ export class CameraService {
       return failure(ErrorLayer.TASK, 'CAMERA_BUSY', 'Another camera operation is active');
     }
     this.operationActive = true;
+    let triggerSent = false;
     try {
       this.ensureNotCancelled(token);
       this.ensureFresh();
@@ -124,38 +163,85 @@ export class CameraService {
       if (!recording) {
         this.ensurePhotoContextSafe();
         this.ensureNotCancelled(token);
+        const contextSentAt = Date.now();
         const contextReply = await this.session.requestNative(0x17, 3, 0xf9, PHOTO_CONTEXT_PAYLOAD, 2000, token);
         if (contextReply === undefined || !bytesEqual(contextReply,
           concatBytes(new Uint8Array([0]), PHOTO_CONTEXT_PAYLOAD))) {
           return failure(ErrorLayer.COMMAND, 'PHOTO_CONTEXT_FAILED',
             `Photo context reply was ${replyDescription(contextReply)}; expected 0x00${toHex(PHOTO_CONTEXT_PAYLOAD)}`);
         }
+        await this.waitPhotoContext(contextSentAt, token);
       }
       this.requireIdle();
       const mode = recording ? VIDEO_MODE : PHOTO_MODE;
       validateCameraRequest(0xff, mode);
       this.ensureNotCancelled(token);
+      const modeSentAt = Date.now();
       const modeReply = await this.session.requestNative(1, 2, 0xff, mode, 2000, token);
       if (!successReply(modeReply)) {
         return failure(ErrorLayer.COMMAND, 'CAMERA_MODE_FAILED',
           `Camera mode reply was ${replyDescription(modeReply)}; capture command was not sent`);
       }
+      await this.waitCameraMode(recording ? 1 : 0, modeSentAt, token);
       this.requireIdle();
       this.ensureNotCancelled(token);
       if (recording) {
         this.recordingRequested = true;
         this.recordingAttemptAtMs = Date.now();
+        this.recordingObservedAtMs = undefined;
+        this.recordingIdleSinceMs = undefined;
       }
       const trigger = new Uint8Array([1]);
       const command = recording ? 2 : 1;
       validateCameraRequest(command, trigger);
+      triggerSent = true;
       const reply = await this.session.requestNative(1, 2, command, trigger, 2000, token);
-      return success(reply === undefined ? 'no_reply' : toHex(reply));
+      if (!successReply(reply)) {
+        const rejected = reply !== undefined;
+        if (recording && rejected) this.recordingRequested = false;
+        return failure(ErrorLayer.COMMAND, rejected ? 'CAMERA_CAPTURE_REJECTED' : 'CAMERA_CAPTURE_UNCONFIRMED',
+          `拍摄请求未获成功回复（${replyDescription(reply)}），请核对飞机相机状态`);
+      }
+      return success(recording ? '飞机已确认录像启动请求' : '飞机已确认拍照请求');
     } catch (error) {
-      return failure(ErrorLayer.TASK, 'CAMERA_CAPTURE_FAILED', errorMessage(error));
+      return failure(ErrorLayer.TASK, triggerSent ? 'CAMERA_CAPTURE_UNCONFIRMED' : 'CAMERA_CAPTURE_FAILED', errorMessage(error));
     } finally {
       this.operationActive = false;
     }
+  }
+
+  private async waitPhotoContext(sentAt: number, token?: CancellationToken): Promise<void> {
+    const deadline = Date.now() + 2500;
+    while (Date.now() < deadline) {
+      this.ensureNotCancelled(token); this.ensureFresh(); this.requireIdle();
+      const telemetry = this.session.snapshot().telemetry;
+      const flight = telemetry.flight;
+      const settledFlight = (telemetry.flightAgeMs ?? Infinity) <= 1000 && flight !== undefined &&
+        ((!flight.airborne && !flight.motorsOn) || (flight.airborne && flight.motorsOn && flight.modeRaw === 6));
+      const task = telemetry.task;
+      const idleOrPhotoTask = task !== undefined &&
+        ((task.phaseRaw === 0 && task.modeRaw === 0) || ([0, 5].includes(task.phaseRaw) && task.modeRaw === 9));
+      if (settledFlight && (telemetry.taskAgeMs ?? Infinity) <= 1000 && telemetry.task !== undefined &&
+        telemetry.task.observedAtMs >= sentAt && idleOrPhotoTask &&
+        telemetry.camera !== undefined && telemetry.camera.observedAtMs >= sentAt) {
+        hilog.info(0, 'NeoCamera', '拍照上下文已观察确认，任务 %{public}s', telemetry.task.payloadHex);
+        return;
+      }
+      await delay(50);
+    }
+    const telemetry = this.session.snapshot().telemetry;
+    throw new Error(`尚未观察到拍照上下文就绪，未切换相机模式（飞行 ${telemetry.flight?.modeRaw}，任务 ${telemetry.task?.payloadHex}，相机模式 ${telemetry.camera?.modeRaw}）`);
+  }
+
+  private async waitCameraMode(mode: number, sentAt: number, token?: CancellationToken): Promise<void> {
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline) {
+      this.ensureNotCancelled(token); this.ensureFresh(); this.requireIdle();
+      const camera = this.session.snapshot().telemetry.camera;
+      if (camera !== undefined && camera.observedAtMs >= sentAt && camera.modeRaw === mode && camera.timeSynchronized) return;
+      await delay(50);
+    }
+    throw new Error('尚未观察到新的相机模式状态，未发送拍摄指令');
   }
 
   private async synchronizeClock(token?: CancellationToken): Promise<OperationResult<string>> {
@@ -203,9 +289,14 @@ export class CameraService {
       throw new Error('Fresh flight state is required before changing photo context');
     }
     const grounded = !flight.motorsOn && !flight.airborne;
-    const manualHover = flight.motorsOn && flight.airborne && flight.modeRaw === 6 &&
-      telemetry.task?.modeRaw === 9;
-    if (!grounded && !manualHover) {
+    const task = telemetry.task;
+    const taskFresh = task !== undefined && (telemetry.taskAgeMs ?? Infinity) <= 1000;
+    const idleOrManual = taskFresh && task !== undefined &&
+      ((task.phaseRaw === 0 && task.modeRaw === 0) || (task.modeRaw === 9 && [0, 5].includes(task.phaseRaw)));
+    const manualHover = flight.motorsOn && flight.airborne && flight.modeRaw === 6 && idleOrManual;
+    const trackedHover = flight.motorsOn && flight.airborne && flight.modeRaw === 26 &&
+      taskFresh && task?.phaseRaw === 0 && task.modeRaw === 0 && telemetry.subject?.tracking === true;
+    if (!grounded && !manualHover && !trackedHover) {
       throw new Error('Photo context requires grounded state or verified manual hover');
     }
   }

@@ -42,6 +42,20 @@ test('late destruction of an old surface cannot stop its replacement',()=>{
   const count=events.length;video.detach('123');assert.equal(events.length,count);
   video.submit(new Uint8Array([1]));assert.equal(events.at(-1),'frame:1');video.detach('456');assert.equal(events.at(-1),'stop');
 });
+test('opening and closing the popup redirects a running decoder without restarting its session', () => {
+  const { VideoPreview } = require(file);
+  const events = [];
+  const video = new VideoPreview({ start: id => events.push(`start:${id}`),
+    stop: () => events.push('stop'), switchSurface: id => { events.push(`switch:${id}`); return true; },
+    submit: () => events.push('frame') });
+  video.setSession('aircraft');
+  video.attach('123');
+  video.attach('456');
+  video.submit(new Uint8Array([1]));
+  video.attach('123');
+  video.detach('456');
+  assert.deepEqual(events, ['start:123', 'switch:456', 'frame', 'switch:123']);
+});
 test('preview starts before opening the handshake socket so the initial codec parameters are retained',()=>{
   const { videoSessionIdentity }=require(file);
   assert.equal(videoSessionIdentity('handshaking','0x1234'),'0x1234');
