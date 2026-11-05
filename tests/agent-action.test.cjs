@@ -111,6 +111,16 @@ test('voice takeoff cannot send against stale, unknown, airborne or spinning fli
   }
 });
 
+test('phone cloud request rejects a response when the control generation changes during inference', async()=>{
+  const {c,obs}=agentController();
+  c.initializeCloudVlm=async()=>{};c.session.snapshot=()=>({phase:'ready'});
+  c.cloudVlm={request:async(observation,text,isCurrent)=>{
+    assert.equal(isCurrent(),true);c.agentGeneration++;assert.equal(isCurrent(),false);
+    return {version:2,requestId:obs.requestId,command:{action:'photo'}};
+  }};
+  await assert.rejects(c.requestCloudAgentAction(obs,'拍照'),/取消|变化/);
+});
+
 test('movement waits for independent confirmation, consumes it once and rejects duplicate responses', async () => {
   const { c, calls, obs } = agentController();
   const response = { version: 2, requestId: 'r1', command: { action: 'move', direction: 'left' } };

@@ -5,7 +5,6 @@ import { DollyFraming } from '../core/protocol/NativeTaskCodec';
 import { promptAction, window } from '@kit.ArkUI';
 import { SubjectBox } from '../core/domain/SubjectObservation';
 import { DollyDemoWindow } from '../core/platform/DollyDemoWindow';
-import { requestAgentAction } from '../core/platform/VlmUsbExport';
 
 interface HeaderView { title: string; detail: string; }
 interface DiagnosticView { label: string; value: string; }
@@ -45,6 +44,9 @@ struct Index {
   @State exportingVlmSample: boolean = false;
   @State vlmListeningActive: boolean = false;
   @State vlmSampleStatus: string = '';
+  @State cloudKeyInput: string = '';
+  @State cloudSettingsBusy: boolean = false;
+  @State cloudSettingsNote: string = '';
 
   aboutToAppear(): void {
     const profile = this.selectedProfile();
@@ -60,6 +62,7 @@ struct Index {
       this.keepVideoScreenOn(snapshot.videoPreview.stats.running);
     });
     this.controller.ensureReadyConnection().catch((error: Error) => { this.vlmSampleStatus = error.message; });
+    this.controller.initializeCloudVlm().catch((error: Error) => { this.cloudSettingsNote = error.message; });
   }
 
   aboutToDisappear(): void {
@@ -81,7 +84,7 @@ struct Index {
     return '正在连接';
   }
 
-  private async exportVlmSample(): Promise<void> {
+  private async runVoiceControl(): Promise<void> {
     if (this.exportingVlmSample) return;
     this.exportingVlmSample = true;
     this.vlmListeningActive = true;
@@ -108,7 +111,7 @@ struct Index {
         const observation = await this.controller.captureAgentObservation();
         if (!this.vlmListeningActive) return;
         try {
-          const response = await requestAgentAction(observation, description);
+          const response = await this.controller.requestCloudAgentAction(observation, description);
           if (!this.vlmListeningActive) return;
           const outcome = await this.controller.acceptAgentResponse(observation, response);
           selectedId = outcome.subjectId;
@@ -121,7 +124,7 @@ struct Index {
     } catch (error) {
       if (this.vlmListeningActive) {
         this.vlmSampleStatus = waitingForFollowUp ? `已选中主体 #${selectedId}，后续聆听已结束` :
-          (error instanceof Error ? error.message : '样本导出失败');
+          (error instanceof Error ? error.message : '语音控制请求失败，请检查手机上网连接');
       }
     } finally {
       this.vlmListeningActive = false;
@@ -157,6 +160,20 @@ struct Index {
     } catch (error) {
       this.vlmSampleStatus = `保存图库失败，预览已保留：${error instanceof Error ? error.message : '请重试'}`;
     }
+  }
+
+  private async updateCloudSettings(action: string): Promise<void> {
+    if (this.cloudSettingsBusy) return;
+    this.cloudSettingsBusy = true; this.cloudSettingsNote = '';
+    try {
+      if (action === 'save') {
+        await this.controller.saveCloudVlmKey(this.cloudKeyInput); this.cloudKeyInput = '';
+      } else if (action === 'clear') {
+        await this.controller.clearCloudVlmKey(); this.cloudKeyInput = '';
+      } else await this.controller.testCloudVlmConnection();
+      this.cloudSettingsNote = this.controller.snapshot().cloudVlmStatus;
+    } catch (error) { this.cloudSettingsNote = error instanceof Error ? error.message : '云端配置操作失败'; }
+    finally { this.cloudSettingsBusy = false; }
   }
 
   private subjectSummary(): string {
@@ -229,6 +246,24 @@ struct Index {
       Scroll() {
         Column() {
           if (this.showEngineering) {
+            this.SectionHeader({ title: '云端语音', detail: this.state.cloudVlmConfigured ? '手机直连 · 已配置' : '待配置' })
+            Text(this.state.cloudVlmStatus).fontSize(12).fontColor('#344054').width('100%')
+            TextInput({ text: this.cloudKeyInput, placeholder: 'DeepSeek API Key（仅保存到手机）' })
+              .type(InputType.Password).width('100%').margin({ top: 8 })
+              .enabled(!this.cloudSettingsBusy && !this.state.busy)
+              .onChange((value: string) => this.cloudKeyInput = value)
+            Row({ space: 8 }) {
+              Button('保存密钥').fontSize(13).layoutWeight(1)
+                .enabled(!this.cloudSettingsBusy && !this.state.busy && this.cloudKeyInput.length > 0)
+                .onClick(() => this.updateCloudSettings('save'))
+              Button('测试连接').fontSize(13).layoutWeight(1)
+                .enabled(!this.cloudSettingsBusy && !this.state.busy)
+                .onClick(() => this.updateCloudSettings('test'))
+              Button('清除密钥').fontSize(13).layoutWeight(1)
+                .enabled(!this.cloudSettingsBusy && !this.state.busy && this.state.cloudVlmConfigured)
+                .onClick(() => this.updateCloudSettings('clear'))
+            }.width('100%').margin({ top: 8 })
+            if (this.cloudSettingsNote.length > 0) Text(this.cloudSettingsNote).fontSize(12).fontColor('#344054').width('100%')
             this.SectionHeader({ title: '目标飞机', detail: this.state.wifiProgress })
             Flex({ wrap: FlexWrap.Wrap }) {
               ForEach(this.state.aircraftProfiles, (profile: AircraftProfileSummary) => {
@@ -600,7 +635,7 @@ struct Index {
             if (this.vlmListeningActive) {
               if (this.state.busy) this.controller.center();
               this.stopVlmListening();
-            } else this.exportVlmSample();
+            } else this.runVoiceControl();
           })
       }.width('100%').padding(12).backgroundColor('#F9FAFB')
       Text('长按起飞 1.5 秒 · 也可点语音说“起飞”或“降落”').fontSize(11).fontColor('#667085').margin({ bottom: 8 })

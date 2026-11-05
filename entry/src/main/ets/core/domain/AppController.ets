@@ -11,6 +11,8 @@ import { FlightCommandService, FlightCommandSnapshot } from './FlightCommandServ
 import { MediaRepository } from '../media/MediaRepository';
 import { MediaKind } from '../media/MediaDirectory';
 import { GallerySaver } from '../platform/GallerySaver';
+import { CloudVlmKeyStore } from '../platform/CloudVlmKeyStore';
+import { CloudVlmClient } from '../platform/CloudVlmClient';
 import { CaptureMedia } from '../media/CaptureMedia';
 import { MediaDownloadResult } from '../media/MediaDownloader';
 import { CancellationToken, ErrorLayer, failure, OperationResult, success } from './OperationResult';
@@ -56,6 +58,8 @@ export interface ConsoleSnapshot {
   agentMediaSaving: boolean;
   agentMediaCount: number;
   agentMediaIndex: number;
+  cloudVlmConfigured: boolean;
+  cloudVlmStatus: string;
   subjectScanStatus: string;
 }
 
@@ -107,6 +111,12 @@ export class AppController {
   private agentMediaSaving: boolean = false;
   private agentMediaUris: string[] = [];
   private agentMediaIndex: number = 0;
+  private readonly cloudKeys: CloudVlmKeyStore = new CloudVlmKeyStore();
+  private readonly cloudVlm: CloudVlmClient = new CloudVlmClient(this.cloudKeys);
+  private cloudInitialized: boolean = false;
+  private cloudInitialization?: Promise<void>;
+  private cloudVlmConfigured: boolean = false;
+  private cloudVlmStatus: string = '手机直连DeepSeek，等待读取配置';
   private readonly gallerySaver: GallerySaver = new GallerySaver();
   private readonly captureMedia: CaptureMedia;
   private demoStage: string = 'closed';
@@ -214,6 +224,7 @@ export class AppController {
       agentFeedback: this.agentFeedback, agentMediaUri: this.agentMediaUri, agentMediaKind: this.agentMediaKind,
       agentMediaSaving: this.agentMediaSaving,
       agentMediaCount: this.agentMediaUris.length, agentMediaIndex: this.agentMediaIndex,
+      cloudVlmConfigured: this.cloudVlmConfigured, cloudVlmStatus: this.cloudVlmStatus,
       subjectScanStatus: this.autoScanMessage
     };
   }
@@ -911,6 +922,7 @@ export class AppController {
   cancelAgentAction(): void {
     this.pendingAgentAction = undefined;
     this.agentGeneration++;
+    this.cloudVlm?.cancelPending();
     this.acceptedAgentRequestId = this.latestAgentRequestId;
     this.agentFeedback = '语音动作已取消';
     this.emit();
@@ -979,6 +991,62 @@ export class AppController {
   async executeLocalFlightVoice(text: string): Promise<AgentOutcome | undefined> {
     const action = parseDirectFlightVoice(text);
     return action === undefined ? undefined : this.performVoiceFlightAction(action);
+  }
+
+  async initializeCloudVlm(): Promise<void> {
+    if (this.cloudInitialized) return;
+    if (this.cloudInitialization === undefined) this.cloudInitialization = this.loadCloudVlm();
+    try { await this.cloudInitialization; } finally { this.cloudInitialization = undefined; }
+  }
+
+  private async loadCloudVlm(): Promise<void> {
+    try {
+      await this.cloudKeys.importPrivateFile(`${this.outputDirectory}/cloud-key-import.txt`);
+      this.cloudVlmConfigured = (await this.cloudKeys.read()) !== undefined;
+      this.cloudVlmStatus = this.cloudVlmConfigured ? '手机直连DeepSeek，密钥已配置' : '尚未配置云端密钥，请长按标题打开设置';
+      this.cloudInitialized = true;
+    } catch (error) {
+      this.cloudVlmStatus = asError(error).message;
+      throw asError(error);
+    } finally { this.emit(); }
+  }
+
+  async saveCloudVlmKey(key: string): Promise<void> {
+    this.cancelAgentAction();
+    await this.cloudKeys.save(key);
+    this.cloudInitialized = true; this.cloudVlmConfigured = true;
+    this.cloudVlmStatus = '密钥已保存到手机安全存储'; this.emit();
+  }
+
+  async clearCloudVlmKey(): Promise<void> {
+    this.cancelAgentAction();
+    await this.cloudKeys.clear();
+    this.cloudInitialized = true; this.cloudVlmConfigured = false;
+    this.cloudVlmStatus = '云端密钥已清除'; this.emit();
+  }
+
+  async testCloudVlmConnection(): Promise<void> {
+    await this.initializeCloudVlm();
+    this.cloudVlmStatus = '正在测试手机到DeepSeek的连接…'; this.emit();
+    try {
+      const started = Date.now(); await this.cloudVlm.testConnection();
+      this.cloudVlmConfigured = true;
+      this.cloudVlmStatus = `手机直连正常，耗时${Date.now() - started}毫秒`;
+      this.log(this.cloudVlmStatus);
+    } catch (error) { this.cloudVlmStatus = asError(error).message; throw asError(error); }
+    finally { this.emit(); }
+  }
+
+  async requestCloudAgentAction(observation: AgentObservation, description: string): Promise<AgentResponse> {
+    await this.initializeCloudVlm();
+    const isCurrent = (): boolean => observation.controlGeneration === this.agentGeneration &&
+      observation.sessionId === this.session.sessionId() && observation.flightGeneration === this.flight.snapshot().generation &&
+      observation.requestId === this.latestAgentRequestId && this.session.snapshot().phase === 'ready';
+    const started = Date.now();
+    const response = await this.cloudVlm.request(observation, description, isCurrent);
+    if (!isCurrent()) throw new Error('云端请求已取消或飞机会话发生变化');
+    this.cloudVlmStatus = `手机直连DeepSeek · ${Date.now() - started}毫秒`; this.emit();
+    return response;
   }
 
   private async performVoiceFlightAction(action: DirectFlightAction): Promise<AgentOutcome> {
@@ -1494,6 +1562,7 @@ export class AppController {
   private cancelOperations(): void {
     this.pendingAgentAction = undefined;
     this.agentGeneration++;
+    this.cloudVlm?.cancelPending();
     this.operationToken?.cancel(); this.nativeTasks.cancel(); this.voice.cancelPending();
     if (this.demoStage === 'preflight' || this.demoStage === 'confirm' || this.demoStage === 'starting' || this.demoStage === 'shooting') {
       this.demoStage = 'failed';
