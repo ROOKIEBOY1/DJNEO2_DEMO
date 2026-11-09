@@ -1,0 +1,21 @@
+{
+  "source": "diagnostics/closeup-latest-archives.log",
+  "sourceLines": [430, 434, 436, 440, 443, 444, 446, 449, 450],
+  "evidence": "State-log reconstruction, not raw DUML. Camera mode was not logged. The log reports recording=false throughout and recording state 0 at 16:19:27.535; the aircraft remained airborne with motors on until the later landing request at 16:19:52.478. Fresh 100ms task/camera/flight reports between these logged state transitions are simulated by the replay harness.",
+  "targetId": 11,
+  "startAtMs": 1794212367279,
+  "startReply": "00",
+  "config": {"radiusMeters": 2, "framing": "半身", "zoom": 3, "retreat": true},
+  "columns": ["offsetMs", "taskPayloadHex", "flightModeRaw", "tracking"],
+  "transitions": [
+    [0, "0000000100", 26, true],
+    [98, "050d000100", 26, false],
+    [256, "050d000100", 37, false],
+    [349, "050d000100", 37, true],
+    [3107, "050d000100", 37, false],
+    [3305, "0400000100", 37, false],
+    [3355, "0400000100", 15, false],
+    [4360, "0000000102", 15, false],
+    [4561, "0000000102", 26, true]
+  ]
+}

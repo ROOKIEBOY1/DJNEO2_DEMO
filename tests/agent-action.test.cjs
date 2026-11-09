@@ -2,7 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { validateAgentAction, validateAgentResponse, agentNeedsConfirmation } =
   require('../entry/src/main/ets/core/domain/AgentAction.ets');
-const {parseDirectFlightVoice}=require('../entry/src/main/ets/core/domain/AgentAction.ets');
+const {parseDirectFlightVoice,parseDirectStopVoice}=require('../entry/src/main/ets/core/domain/AgentAction.ets');
 const { AppController } = require('../entry/src/main/ets/core/domain/AppController.ets');
 const { CancellationToken } = require('../entry/src/main/ets/core/domain/OperationResult.ets');
 
@@ -55,6 +55,44 @@ test('local takeoff and landing reuse the flight entry points without exporting 
   await assert.rejects(c.executeLocalFlightVoice('起飞'),/操作|执行|忙/);
 });
 
+test('local stop voice accepts short affirmative commands and keeps negation questions hypotheticals and quotes out',()=>{
+  assert.ok(parseDirectStopVoice,'direct stop parser must be available');
+  for(const text of ['停止','停止任务','停止拍摄','先停止','请停止。','请帮我立即停止任务！','无人机停止一下'])
+    assert.equal(parseDirectStopVoice(text),'stop',text);
+  for(const text of ['停止录像','先停止录像','请帮我停止录制','马上停止录像吧'])
+    assert.equal(parseDirectStopVoice(text),'record_stop',text);
+  for(const text of ['不要停止','别停止录像','不停止任务','停止？','停止了吗','可以停止吗','如果停止',
+    '假如停止录像','“停止”','他说停止任务','停止再起飞','先停止然后降落','停止不是我要的','停止任务吗',''])
+    assert.equal(parseDirectStopVoice(text),undefined,text);
+});
+
+test('local stop interrupts a busy scan through existing stop entry points while takeoff stays blocked',async()=>{
+  for(const [text,kind] of [['停止任务','stop'],['停止录像','record_stop']]) {
+    const {c}=agentController();
+    c.busyValue=true;c.autoScanRunning=true;c.lastErrorValue='';
+    const called=[];
+    c.center=async()=>{called.push('stop');};
+    c.stopRecording=async()=>{called.push('record_stop');c.agentFeedback='飞机已确认停止录像请求';};
+    c.captureAgentObservation=async()=>{throw new Error('local stop must not capture an image');};
+    c.requestCloudAgentAction=async()=>{throw new Error('local stop must not wait for cloud classification');};
+    const outcome=await c.executeLocalFlightVoice(text);
+    assert.deepEqual(called,[kind]);
+    assert.match(outcome.message,/停止/);
+    await assert.rejects(c.executeLocalFlightVoice('起飞'),/操作|执行|忙/);
+    assert.deepEqual(called,[kind]);
+    assert.equal(await c.executeLocalFlightVoice('不要停止'),undefined);
+    assert.deepEqual(called,[kind]);
+  }
+});
+
+test('local stop reports the existing stop entry point failure instead of claiming success',async()=>{
+  for(const [text,method] of [['停止任务','center'],['停止录像','stopRecording']]) {
+    const {c}=agentController();c.busyValue=true;c.lastErrorValue='';
+    c[method]=async()=>{c.lastErrorValue='飞机未确认停止请求';};
+    await assert.rejects(c.executeLocalFlightVoice(text),/飞机未确认停止请求/);
+  }
+});
+
 test('agent responses bind to a single recent request and flight cycle', () => {
   const response = { version: 2, requestId: 'r1', command: { action: 'photo' } };
   validateAgentResponse(response, observation, 10, 2, 1500);
@@ -62,6 +100,27 @@ test('agent responses bind to a single recent request and flight cycle', () => {
   assert.throws(() => validateAgentResponse(response, observation, 12, 2, 1500));
   assert.throws(() => validateAgentResponse(response, observation, 10, 3, 1500));
   assert.throws(() => validateAgentResponse(response, observation, 10, 2, 22000));
+});
+
+test('text planning may take up to one minute while visual decisions keep their shorter lifetime', () => {
+  const textObservation = { ...observation, frame: undefined };
+  const response = { version: 2, requestId: 'r1', command: { action: 'photo' } };
+  validateAgentResponse(response, textObservation, 10, 2, 31000);
+  validateAgentResponse(response, textObservation, 10, 2, 61000);
+  assert.throws(() => validateAgentResponse(response, textObservation, 10, 2, 61001));
+  assert.throws(() => validateAgentResponse(response, observation, 10, 2, 21001));
+  assert.throws(() => validateAgentResponse(response, textObservation, 11, 2, 31000));
+  assert.throws(() => validateAgentResponse(response, textObservation, 10, 3, 31000));
+});
+
+test('a slow text decision still receives a usable local confirmation window', async () => {
+  const { c, obs } = agentController();
+  const textObservation = { ...obs, frame: undefined, requestedAtMs: Date.now() - 30000 };
+  const response = { version: 2, requestId: 'r1', command: { action: 'move', direction: 'left' } };
+  const outcome = await c.acceptAgentResponse(textObservation, response);
+  assert.equal(outcome.confirmationRequired, true);
+  assert.ok(c.pendingAgentAction.expiresAt > Date.now());
+  assert.ok(c.pendingAgentAction.expiresAt <= Date.now() + 10000);
 });
 
 
@@ -167,11 +226,12 @@ test('a single airborne request prepares new dolly parameters, reselects its tar
     const { c, obs } = agentController();
     const events = [];
     obs.frame.currentSubjectId = 11;
-    const state = { telemetry: { flightAgeMs: 0,
+    const state = { telemetry: { flightAgeMs: 0, taskAgeMs: 0, cameraAgeMs: 0,
       flight: { airborne: true, motorsOn: true, modeRaw: 26 },
-      task: { modeRaw: 0, phaseRaw: 0 }, subject: { tracking: true, overlay: [{ id: 11 }] } } };
+      task: { modeRaw: 0, phaseRaw: 0 }, camera: { recordingCandidate: false },
+      subject: { tracking: true, overlay: [{ id: 11 }], get trackingAt() { return Date.now(); } } } };
     c.session.snapshot = () => state;
-    c.flight.snapshot = () => ({ generation: 2, takeoffAcknowledged: true });
+    c.flight.snapshot = () => ({ generation: 2, takeoffSent: true, takeoffAcknowledged: true });
     c.nativeConfig = { radiusMeters: 2, framing: '全身', zoom: 2, retreat: false };
     c.nativeTasks.snapshot = () => ({ kind: '', prepared: false });
     c.nativeTasks.prepareHover = async (task, config) => {
@@ -210,8 +270,9 @@ test('independent follow requires confirmation before any preparation or flight 
 test('another airborne dolly hands off the completed task before changing parameters or preparing', async () => {
   const {c,obs}=agentController();const events=[];let owned=true;
   obs.frame.currentSubjectId=11;
-  const state={telemetry:{flightAgeMs:0,flight:{modeRaw:26,airborne:true,motorsOn:true},
-    task:{modeRaw:0,phaseRaw:0},subject:{tracking:true,overlay:[{id:11}]}}};
+  const state={telemetry:{flightAgeMs:0,taskAgeMs:0,cameraAgeMs:0,flight:{modeRaw:26,airborne:true,motorsOn:true},
+    task:{modeRaw:0,phaseRaw:0},camera:{recordingCandidate:false},
+    subject:{tracking:true,overlay:[{id:11}],get trackingAt(){return Date.now();}}}};
   c.session.snapshot=()=>state;
   c.flight.snapshot=()=>({generation:2,takeoffSent:true,takeoffAcknowledged:true,nativeTaskMayFly:owned});
   c.nativeConfig={radiusMeters:2,framing:'半身',zoom:2,retreat:true};

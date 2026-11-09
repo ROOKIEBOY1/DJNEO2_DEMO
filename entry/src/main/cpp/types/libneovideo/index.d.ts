@@ -17,6 +17,14 @@ export interface VideoPreviewStats {
   lastDecodedAgeMs: number;
   lastRenderedAgeMs: number;
   lastError: string;
+  decoderEpoch: number;
+  consecutiveFailures: number;
+  recoveryPaused: boolean;
+  lastResetReason: string;
+  parameterMask: number;
+  randomAccessFrames: number;
+  acceptedRandomAccessFrames: number;
+  lastSubmittedAgeMs: number;
 }
 export const start: (surfaceId: string) => void;
 export const switchSurface: (surfaceId: string) => boolean;
@@ -31,3 +39,14 @@ export interface DecodedFrame {
 }
 export const requestFrame: () => number;
 export const takeFrame: (ticket: number) => DecodedFrame | undefined;
+export interface MovieExportSnapshot {
+  id: number;
+  stage: string;
+  progress: number;
+  durationMs: number;
+  error: string;
+  outputPath: string;
+}
+export const startMovieExport: (sources: string[], outputPath: string, musicPath: string) => number;
+export const movieExportSnapshot: (id: number) => MovieExportSnapshot;
+export const cancelMovieExport: (id: number) => void;

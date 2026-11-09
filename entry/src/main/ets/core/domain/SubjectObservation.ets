@@ -25,6 +25,12 @@ export interface SubjectSnapshot {
   tracking: boolean;
 }
 
+// Presentation only: keep all scan candidates intact for model input and control.
+export function selectedSubjectOverlay(subject: SubjectSnapshot | undefined, selectedId: number | undefined): SubjectBox[] {
+  if (selectedId === undefined || subject?.tracking !== true || subject.selectedIdCandidate !== selectedId) return [];
+  return subject.overlay.filter((item: SubjectBox) => item.id === selectedId);
+}
+
 function box(id: number, x: number, y: number, width: number, height: number): SubjectBox {
   if (!(x >= 0 && x <= 1 && y >= 0 && y <= 1 && width > 0 && width <= 1 && height > 0 && height <= 1)) {
     throw new Error('Invalid subject coordinates');

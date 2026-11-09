@@ -5,6 +5,9 @@ import { DollyFraming } from '../core/protocol/NativeTaskCodec';
 import { promptAction, window } from '@kit.ArkUI';
 import { SubjectBox } from '../core/domain/SubjectObservation';
 import { DollyDemoWindow } from '../core/platform/DollyDemoWindow';
+import { AssistantSheet } from '../components/AssistantSheet';
+import { AssistantConversation } from '../core/domain/AssistantConversation';
+import { PreviewRecordingClock } from '../core/domain/PreviewRecordingClock';
 
 interface HeaderView { title: string; detail: string; }
 interface DiagnosticView { label: string; value: string; }
@@ -25,6 +28,13 @@ class VideoSurfaceController extends XComponentController {
 @Entry
 @Component
 struct Index {
+  private assistantConversation = new AssistantConversation();
+  private previewRecordingClock = new PreviewRecordingClock();
+  @State @Watch('assistantVisibilityChanged') showAssistant: boolean = false;
+  @State showConsole: boolean = false;
+  @State assistantHeight: number = 70;
+  private assistantDragHeight: number = 70;
+  private pageHeight: number = 800;
   private controller = AppRuntime.controller();
   private videoSurface: VideoSurfaceController = new VideoSurfaceController();
   private desiredScreenOn: boolean = false;
@@ -48,10 +58,17 @@ struct Index {
   @State cloudSettingsBusy: boolean = false;
   @State cloudSettingsNote: string = '';
 
+  private assistantVisibilityChanged(): void {
+    this.getUIContext().animateTo({ duration: 380, curve: Curve.Friction }, () => {
+      this.assistantHeight = this.showAssistant ? 100 : 70;
+    });
+  }
+
   aboutToAppear(): void {
     const profile = this.selectedProfile();
     if (profile !== undefined) this.editProfile(profile);
     this.controller.setListener((snapshot: ConsoleSnapshot) => {
+      this.previewRecordingClock.observe(snapshot, Date.now());
       const restore = this.state.dollyDemo.stage !== 'closed' && snapshot.dollyDemo.stage === 'closed';
       if (this.state.agentConfirmation.length > 0 && snapshot.agentConfirmation.length === 0 &&
         snapshot.agentFeedback === '动作确认已过期，请重新发起') this.vlmSampleStatus = snapshot.agentFeedback;
@@ -106,20 +123,11 @@ struct Index {
           this.vlmSampleStatus = localFlight.message;
           return;
         }
-        if (this.state.busy) throw new Error('当前任务执行中，语音可直接说“降落”，其他指令请稍后');
         this.vlmSampleStatus = `已听到「${description}」，正在理解…`;
-        const observation = await this.controller.captureAgentObservation();
-        if (!this.vlmListeningActive) return;
-        try {
-          const response = await this.controller.requestCloudAgentAction(observation, description);
-          if (!this.vlmListeningActive) return;
-          const outcome = await this.controller.acceptAgentResponse(observation, response);
-          selectedId = outcome.subjectId;
-          if (this.vlmListeningActive) this.vlmSampleStatus = outcome.message;
-          if (outcome.confirmationRequired || selectedId === undefined) return;
-        } finally {
-          this.controller.finishAgentObservation(observation.requestId);
-        }
+        const outcome = await this.controller.runCloudVoiceRequest(description);
+        selectedId = outcome.subjectId;
+        if (this.vlmListeningActive) this.vlmSampleStatus = outcome.message;
+        if (outcome.confirmationRequired || selectedId === undefined) return;
       }
     } catch (error) {
       if (this.vlmListeningActive) {
@@ -147,6 +155,24 @@ struct Index {
       this.vlmSampleStatus = outcome.message;
     } catch (error) {
       this.vlmSampleStatus = error instanceof Error ? error.message : '动作执行失败';
+    }
+  }
+
+  private async confirmGroundDolly(): Promise<void> {
+    try {
+      const outcome = await this.controller.confirmGroundDolly();
+      this.vlmSampleStatus = outcome.message;
+    } catch (error) {
+      this.vlmSampleStatus = error instanceof Error ? error.message : '拍摄启动失败';
+    }
+  }
+
+  private async executeGroundDolly(): Promise<void> {
+    try {
+      const outcome = await this.controller.executeGroundDolly();
+      this.vlmSampleStatus = outcome.message;
+    } catch (error) {
+      this.vlmSampleStatus = error instanceof Error ? error.message : '拍摄启动失败';
     }
   }
 
@@ -226,13 +252,15 @@ struct Index {
       .padding({ left: 10 }).backgroundColor('#F9FAFB').borderRadius(4)
   }
 
-  build() {
+  @Builder
+  controlConsole() {
     Column() {
       Row() {
         Column() {
           Text('NEO 2 CONTROL').fontSize(20).fontWeight(FontWeight.Bold).fontColor('#101828')
             .gesture(LongPressGesture({ repeat: false, duration: 1000 }).onAction(() => {
               this.showEngineering = !this.showEngineering;
+              if (!this.showEngineering) { this.showConsole = false; this.showAssistant = true; }
             }))
           Text(this.showEngineering ? '设置 · 长按标题返回' : '长按标题进入设置').fontSize(12).fontColor('#667085')
         }.alignItems(HorizontalAlign.Start)
@@ -443,13 +471,12 @@ struct Index {
               .width('100%').height('100%')
             if (this.state.dollyDemo.stage === 'closed' && this.state.videoPreview.state === 'live' &&
               this.state.videoPreview.stats.lastRenderedAgeMs <= 1000) {
-              ForEach(this.state.session.telemetry.subject?.overlay ?? [], (item: SubjectBox) => {
-                Column() {
-                  Text(`#${item.id}`).fontSize(11).fontColor(Color.Black).backgroundColor('#7EF2A3')
-                }
+              ForEach(this.state.selectedSubjectOverlay, (item: SubjectBox) => {
+                Column()
                 .width(`${item.width * 100}%`).height(`${item.height * 100}%`)
                 .position({ x: `${item.left * 100}%`, y: `${item.top * 100}%` })
-                .border({ width: 2, color: '#7EF2A3' }).alignItems(HorizontalAlign.Start)
+                .border({ width: 2, color: '#F472B6' }).borderRadius(5)
+                .alignItems(HorizontalAlign.Start)
                 .hitTestBehavior(HitTestMode.None)
               }, (item: SubjectBox) => `${item.id}:${item.left}:${item.top}:${item.width}:${item.height}`)
             }
@@ -465,6 +492,19 @@ struct Index {
             Text(this.state.subjectScanStatus).fontSize(13).fontColor('#344054')
             Text(this.subjectSummary()).fontSize(12).fontColor('#667085')
             if (this.vlmSampleStatus.length > 0) Text(this.vlmSampleStatus).fontSize(12).fontColor('#344054')
+            if (this.state.groundDolly.message.length > 0) {
+              Text(this.state.groundDolly.message).fontSize(13).fontColor('#9D174D')
+            }
+            if (this.state.groundDolly.stage === 'confirm') {
+              Row({ space: 8 }) {
+                Button('确认拍摄主体').fontSize(13).enabled(!this.state.busy && this.state.selectedSubjectOverlay.length === 1)
+                  .onClick(() => this.confirmGroundDolly())
+              }
+            }
+            if (this.state.groundDolly.stage === 'plan') {
+              Button('一键执行').fontSize(13).enabled(!this.state.busy && this.state.selectedSubjectOverlay.length === 1)
+                .onClick(() => this.executeGroundDolly())
+            }
             if (this.state.agentConfirmation.length > 0) {
               Text(`待确认 · ${this.state.agentConfirmation}`).fontSize(13).fontColor('#B54708')
               Row({ space: 8 }) {
@@ -635,10 +675,40 @@ struct Index {
             if (this.vlmListeningActive) {
               if (this.state.busy) this.controller.center();
               this.stopVlmListening();
-            } else this.runVoiceControl();
+            } else this.showAssistant = true;
           })
       }.width('100%').padding(12).backgroundColor('#F9FAFB')
       Text('长按起飞 1.5 秒 · 也可点语音说“起飞”或“降落”').fontSize(11).fontColor('#667085').margin({ bottom: 8 })
     }.width('100%').height('100%').backgroundColor('#FFFFFF')
+  }
+
+  build() {
+    Stack({ alignContent: Alignment.Bottom }) {
+      if (!this.showConsole) {
+        // Keep receiving codec parameters before the first voice message creates the visible chat surface.
+        XComponent({ id: 'neoVideoWarmup', type: XComponentType.SURFACE, controller: this.videoSurface })
+          .width('100%').height('100%').opacity(0).hitTestBehavior(HitTestMode.None)
+      }
+      Image($r('app.media.demo_desktop_background')).width('100%').height('100%').objectFit(ImageFit.Cover)
+      if (this.showConsole) this.controlConsole()
+      else this.assistantContent()
+    }.width('100%').height('100%')
+      .onAreaChange((_oldArea: Area, newArea: Area) => {
+        const height = Number(newArea.height);
+        if (height > 0) this.pageHeight = height;
+      })
+  }
+
+  @Builder
+  assistantContent() {
+    AssistantSheet({ expanded: $showAssistant, conversation: this.assistantConversation, recordingClock: this.previewRecordingClock, onClose: () => {
+      this.showAssistant = false; this.videoSurface.restore();
+    },
+      onSettings: () => { this.showConsole = true; this.showEngineering = true; this.showAssistant = false; },
+      onResizeStart: () => { this.assistantDragHeight = this.assistantHeight; },
+      onResize: (offsetY: number) => {
+        this.assistantHeight = Math.max(45, Math.min(100, this.assistantDragHeight - offsetY / this.pageHeight * 100));
+      } })
+      .width('100%').height(`${this.assistantHeight}%`)
   }
 }

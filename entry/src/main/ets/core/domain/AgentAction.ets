@@ -15,12 +15,20 @@ export function parseDirectFlightVoice(text: string): DirectFlightAction | undef
   return match[1] === '起飞' ? 'takeoff' : 'land';
 }
 
+export function parseDirectStopVoice(text: string): 'stop' | 'record_stop' | undefined {
+  const normalized = text.trim().replace(/[\s，。！,.!]/g, '');
+  const match = normalized.match(/^(?:请帮我|请|帮我|请让无人机|让无人机|无人机|飞机|让飞机)?(?:现在|立即|马上|先)?(停止(?:任务|拍摄|运镜|录像|录制)?)(?:吧|一下)?$/);
+  if (match === null) return undefined;
+  return match[1] === '停止录像' || match[1] === '停止录制' ? 'record_stop' : 'stop';
+}
+
 export interface AgentAction {
   action: AgentActionKind;
   subjectId?: number;
   framing?: DollyFraming;
   zoom?: number;
   retreat?: boolean;
+  recipe?: 'dolly_circle';
   radiusMeters?: number;
   direction?: MovementDirection;
   seconds?: number;
@@ -47,6 +55,7 @@ export interface AgentContext {
 }
 
 export interface AgentObservation {
+  purpose?: 'shoot_intent' | 'ground_dolly_intent' | 'dolly_subject';
   requestId: string;
   sessionId: number;
   flightGeneration: number;
@@ -54,6 +63,13 @@ export interface AgentObservation {
   requestedAtMs: number;
   context: AgentContext;
   frame?: VlmFrame;
+}
+
+// Text-only planning can wait longer without extending the lifetime of visual IDs.
+export const AGENT_TEXT_TIMEOUT_MS: number = 60000;
+
+export function agentObservationTimeoutMs(observation: AgentObservation): number {
+  return observation.frame === undefined ? AGENT_TEXT_TIMEOUT_MS : VLM_SELECTION_TIMEOUT_MS;
 }
 
 export interface AgentResponse {
@@ -79,9 +95,9 @@ export function validateAgentAction(command: AgentAction, observation: AgentObse
   switch (command.action) {
     case 'select_subject': case 'photo': case 'follow': fields = ['subjectId']; break;
     case 'set_dolly': fields = ['framing', 'zoom', 'retreat']; break;
-    case 'dolly_zoom': fields = ['subjectId', 'framing', 'zoom', 'retreat']; break;
+    case 'dolly_zoom': fields = ['subjectId', 'framing', 'zoom', 'retreat', 'recipe']; break;
     case 'prepare_dolly': fields = ['framing', 'zoom', 'retreat']; break;
-    case 'circle': fields = ['radiusMeters']; break;
+    case 'circle': fields = ['radiusMeters', 'subjectId']; break;
     case 'move': fields = ['direction', 'seconds']; break;
     case 'none': fields = ['message']; break;
     case 'cancel_subject': case 'record_start': case 'record_stop':
@@ -98,6 +114,7 @@ export function validateAgentAction(command: AgentAction, observation: AgentObse
   if (command.framing !== undefined && !['半身', '全身', '远景'].includes(command.framing)) throw new Error('景别无效');
   if (command.zoom !== undefined && command.zoom !== 2 && command.zoom !== 3) throw new Error('倍率仅支持 2 或 3');
   if (command.retreat !== undefined && typeof command.retreat !== 'boolean') throw new Error('渐远参数无效');
+  if (command.recipe !== undefined && command.recipe !== 'dolly_circle') throw new Error('不支持的拍摄组合');
   if (command.radiusMeters !== undefined && (typeof command.radiusMeters !== 'number' ||
     !Number.isFinite(command.radiusMeters) || command.radiusMeters < 2 || command.radiusMeters > 10)) {
     throw new Error('环绕半径需要在 2–10 米内');
@@ -118,7 +135,7 @@ export function validateAgentResponse(response: AgentResponse, observation: Agen
   const age = now - observation.requestedAtMs;
   if (response === null || typeof response !== 'object' || response.version !== 2 ||
     response.requestId !== observation.requestId || sessionId !== observation.sessionId ||
-    generation !== observation.flightGeneration || age < 0 || age > VLM_SELECTION_TIMEOUT_MS) {
+    generation !== observation.flightGeneration || age < 0 || age > agentObservationTimeoutMs(observation)) {
     throw new Error('动作响应已过期或飞机会话发生变化');
   }
   if (response.error !== undefined) throw new Error('云端识别失败，请重试');
@@ -132,8 +149,10 @@ export function agentActionLabel(command: AgentAction): string {
     case 'cancel_subject': return '取消主体锁定';
     case 'set_dolly': return '设置滑动变焦参数';
     case 'prepare_dolly': return '地面准备滑动变焦';
-    case 'dolly_zoom': return `启动希区柯克 · ${command.framing} · ${command.zoom} 倍${command.subjectId === undefined ? '' : ` · 主体 #${command.subjectId}`}`;
-    case 'circle': return `启动环绕 · 半径 ${command.radiusMeters} 米`;
+    case 'dolly_zoom': return command.recipe === 'dolly_circle' ?
+      `启动特写组合 · 滑动变焦→同主体2米环绕${command.subjectId === undefined ? '' : ` · 主体 #${command.subjectId}`}` :
+      `启动希区柯克 · ${command.framing} · ${command.zoom} 倍${command.subjectId === undefined ? '' : ` · 主体 #${command.subjectId}`}`;
+    case 'circle': return `启动环绕 · 半径 ${command.radiusMeters ?? 2} 米${command.subjectId === undefined ? '' : ` · 主体 #${command.subjectId}`}`;
     case 'follow': return `启动独立跟随${command.subjectId === undefined ? '' : ` · 主体 #${command.subjectId}`}`;
     case 'photo': return '拍照';
     case 'record_start': return '开始录像';

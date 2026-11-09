@@ -1,5 +1,7 @@
 #include "FrameQueue.h"
 #include "HevcStream.h"
+#include "VideoRecovery.h"
+#include "MovieExport.h"
 #include <napi/native_api.h>
 #include <multimedia/player_framework/native_avcodec_videodecoder.h>
 #include <multimedia/player_framework/native_avbuffer.h>
@@ -22,11 +24,13 @@ namespace {
 using Clock = std::chrono::steady_clock;
 int64_t Now() { return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count(); }
 struct Stats {
-    bool running = false, waitingForKey = true;
+    bool running = false, waitingForKey = true, recoveryPaused = false;
     uint64_t assembled = 0, submitted = 0, decoded = 0, rendered = 0, errors = 0, suppressed = 0, reordered = 0;
+    uint64_t decoderEpoch = 0, randomAccess = 0, acceptedRandomAccess = 0;
+    unsigned consecutiveFailures = 0, parameterMask = 0;
     int width = 0, height = 0;
-    int64_t assembledAt = 0, decodedAt = 0, renderedAt = 0;
-    std::string error;
+    int64_t assembledAt = 0, submittedAt = 0, decodedAt = 0, renderedAt = 0;
+    std::string error, lastResetReason;
 };
 struct Buffer { uint32_t index; OH_AVBuffer *data; };
 struct CapturedFrame {
@@ -211,7 +215,7 @@ public:
         Stop();
         { std::lock_guard<std::mutex> lock(mutex_); stats_ = {}; stats_.running = true;
           frames_ = neo::FrameQueue(); rejected_ = 0; stopping_ = false; discontinuity_ = false; callbackError_ = 0;
-          pendingSurface_ = 0; captureTicket_ = 0; captured_ = {}; }
+          pendingSurface_ = 0; captureTicket_ = 0; captured_ = {}; stats_.lastResetReason = "session-start"; }
         worker_ = std::thread([this, surface] { Run(surface); });
     }
     uint32_t RequestFrame() {
@@ -286,7 +290,24 @@ private:
         std::lock_guard<std::mutex> lock(mutex_); ++stats_.errors; stats_.error = message;
         OH_LOG_Print(LOG_APP, LOG_ERROR, 0, "NeoVideo", "%{public}s", message.c_str());
     }
+    void LogState(const char *event, uint64_t surface) {
+        size_t queued, bytes; uint64_t dropped;
+        const auto s = Snapshot(queued, bytes, dropped);
+        const auto now = Now();
+        const auto age = [now](int64_t at) -> long long { return at ? now - at : -1; };
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0, "NeoVideo",
+            "event=%{public}s epoch=%{public}llu surface=%{public}llu reset=%{public}s failures=%{public}u paused=%{public}d running=%{public}d waitingKey=%{public}d mask=%{public}u size=%{public}dx%{public}d irap=%{public}llu accepted=%{public}llu frames=%{public}llu submitted=%{public}llu decoded=%{public}llu rendered=%{public}llu queue=%{public}zu bytes=%{public}zu drops=%{public}llu errors=%{public}llu assembledAge=%{public}lld submittedAge=%{public}lld decodedAge=%{public}lld age=%{public}lld",
+            event, static_cast<unsigned long long>(s.decoderEpoch), static_cast<unsigned long long>(surface),
+            s.lastResetReason.c_str(), s.consecutiveFailures, s.recoveryPaused, s.running, s.waitingForKey,
+            s.parameterMask, s.width, s.height, static_cast<unsigned long long>(s.randomAccess),
+            static_cast<unsigned long long>(s.acceptedRandomAccess), static_cast<unsigned long long>(s.assembled),
+            static_cast<unsigned long long>(s.submitted), static_cast<unsigned long long>(s.decoded),
+            static_cast<unsigned long long>(s.rendered), queued, bytes, static_cast<unsigned long long>(dropped),
+            static_cast<unsigned long long>(s.errors), age(s.assembledAt), age(s.submittedAt),
+            age(s.decodedAt), age(s.renderedAt));
+    }
     bool Create(int width, int height) {
+        { std::lock_guard<std::mutex> lock(mutex_); stats_.decoderEpoch = ++codecSequence_; }
         codec_ = OH_VideoDecoder_CreateByMime("video/hevc");
         if (!codec_) { Fail("设备无法创建 HEVC 解码器"); return false; }
         context_ = std::make_unique<Context>(); context_->owner = this;
@@ -344,20 +365,35 @@ private:
         return changed;
     }
     void Run(uint64_t surface) {
+        LogState("worker-start", surface);
         if (OH_NativeWindow_CreateNativeWindowFromSurfaceId(surface, &window_) != 0 || !window_) {
             Fail("无法绑定视频显示区域");
-            std::lock_guard<std::mutex> lock(mutex_); stats_.running = false; return;
+            { std::lock_guard<std::mutex> lock(mutex_); stats_.running = false; stats_.lastResetReason = "surface-bind-failed"; }
+            LogState("worker-failed", surface);
+            return;
         }
         neo::HevcStream stream; std::deque<neo::AccessUnit> ready;
         // Parameters belong to this worker session, never to the reusable facade.
         std::array<neo::Bytes, 3> parameters;
         FrameDecoder readback;
-        bool waitingKey = true; unsigned retries = 0, startupLogs = 0; int64_t startedAt = 0, lastInput = 0, lastPts = 0;
+        neo::VideoRecovery recovery;
+        bool waitingKey = true; unsigned startupLogs = 0; int64_t startedAt = 0, lastInput = 0, lastPts = 0;
         int64_t lastStatsLog = Now();
-        auto reset = [&] {
+        auto recordRecovery = [&] {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stats_.consecutiveFailures = recovery.Failures(); stats_.recoveryPaused = recovery.Paused();
+        };
+        auto restartEvidence = [&](const char *reason) {
+            recovery.OnDiscontinuity(); startupLogs = 0;
+            std::lock_guard<std::mutex> lock(mutex_);
+            stats_.lastResetReason = reason;
+        };
+        auto reset = [&](const char *reason) {
+            restartEvidence(reason);
             Destroy(); ready.clear(); waitingKey = true; stream.Reset(); parameters = {};
             readback.Reset();
-            std::lock_guard<std::mutex> lock(mutex_); frames_.Clear();
+            { std::lock_guard<std::mutex> lock(mutex_); frames_.Clear(); stats_.parameterMask = 0; }
+            recordRecovery(); LogState("reset", surface);
         };
         while (true) {
             neo::Bytes frame; bool discontinuity = false; int32_t error = 0;
@@ -375,25 +411,32 @@ private:
                 outputs.swap(outputs_);
             }
             if (discontinuity || error) {
-                if (error) { Fail("HEVC 解码异常，错误码 " + std::to_string(error)); ++retries; }
-                reset(); outputs.clear(); frame.clear();
+                if (error) { Fail("HEVC 解码异常，错误码 " + std::to_string(error)); recovery.Failed(); }
+                reset(error ? "codec-callback-error" : "input-queue-discontinuity"); outputs.clear(); frame.clear();
             }
             if (nextSurface != 0) {
                 OHNativeWindow *nextWindow = nullptr;
                 if (OH_NativeWindow_CreateNativeWindowFromSurfaceId(nextSurface, &nextWindow) != 0 || !nextWindow) {
                     if (nextWindow) OH_NativeWindow_DestroyNativeWindow(nextWindow);
                     Fail("无法切换视频显示区域");
-                    { std::lock_guard<std::mutex> lock(mutex_); stats_.running = false; }
+                    { std::lock_guard<std::mutex> lock(mutex_); stats_.running = false; stats_.lastResetReason = "surface-bind-failed"; }
+                    LogState("worker-failed", nextSurface);
                     break;
                 }
-                if (codec_ && OH_VideoDecoder_SetSurface(codec_, nextWindow) != AV_ERR_OK) {
+                const int code = codec_ ? OH_VideoDecoder_SetSurface(codec_, nextWindow) : AV_ERR_OK;
+                if (code != AV_ERR_OK) {
                     // Devices that cannot switch a running decoder still retain this session's VPS/SPS/PPS.
                     Destroy(); ready.clear(); outputs.clear(); waitingKey = true;
                     readback.Reset();
+                    restartEvidence("surface-switch-recreate");
                 }
+                recovery.OnDiscontinuity();
+                OH_LOG_Print(LOG_APP, LOG_INFO, 0, "NeoVideo", "surface-switch from=%{public}llu to=%{public}llu code=%{public}d",
+                    static_cast<unsigned long long>(surface), static_cast<unsigned long long>(nextSurface), code);
                 OH_NativeWindow_DestroyNativeWindow(window_);
-                window_ = nextWindow;
-                std::lock_guard<std::mutex> lock(mutex_); stats_.renderedAt = 0;
+                window_ = nextWindow; surface = nextSurface;
+                { std::lock_guard<std::mutex> lock(mutex_); stats_.renderedAt = 0; }
+                LogState("surface-switch", surface);
             }
             // Output handles cannot outlive their codec generation. Reset above
             // discards all handles from the destroyed generation before rendering.
@@ -404,32 +447,57 @@ private:
                     OH_VideoDecoder_FreeOutputBuffer(codec_, output.index); continue;
                 }
                 const auto result = OH_VideoDecoder_RenderOutputBuffer(codec_, output.index);
-                std::lock_guard<std::mutex> lock(mutex_);
-                ++stats_.decoded; stats_.decodedAt = Now();
-                if (result == AV_ERR_OK) { ++stats_.rendered; stats_.renderedAt = Now(); stats_.error.clear(); }
-                else { ++stats_.errors; stats_.error = "视频送显失败，错误码 " + std::to_string(result); callbackError_ = result; }
+                bool stable = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    ++stats_.decoded; stats_.decodedAt = Now();
+                    if (result == AV_ERR_OK) {
+                        ++stats_.rendered; stats_.renderedAt = Now(); stats_.error.clear();
+                        stable = recovery.OnRendered(stats_.renderedAt);
+                    } else {
+                        ++stats_.errors; stats_.error = "视频送显失败，错误码 " + std::to_string(result); callbackError_ = result;
+                        recovery.OnDiscontinuity();
+                    }
+                }
+                if (stable) { recordRecovery(); LogState("recovery-stable", surface); }
             }
-            if (retries < 3) {
+            if (!recovery.Paused()) {
                 auto units = frame.empty() ? stream.Drain(Now()) : stream.Feed(frame, Now());
                 { std::lock_guard<std::mutex> lock(mutex_); stats_.suppressed = stream.Suppressed(); stats_.reordered = stream.Reordered(); }
                 for (auto &unit : units) {
                     bool picture = false;
                     bool changed = Parameters(unit.bytes, picture, parameters);
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        stats_.parameterMask = (!parameters[0].empty() ? 1u : 0u) |
+                            (!parameters[1].empty() ? 2u : 0u) | (!parameters[2].empty() ? 4u : 0u);
+                        if (unit.randomAccess) ++stats_.randomAccess;
+                    }
+                    if (changed) {
+                        Destroy(); ready.clear(); waitingKey = true; readback.Reset();
+                        restartEvidence("parameter-change"); LogState("reset", surface);
+                    }
                     if (startupLogs++ < 8) OH_LOG_Print(LOG_APP, LOG_INFO, 0, "NeoVideo",
-                        "startup bytes=%{public}zu picture=%{public}d random=%{public}d config=%{public}d%{public}d%{public}d size=%{public}dx%{public}d",
-                        unit.bytes.size(), picture, unit.randomAccess, !parameters[0].empty(), !parameters[1].empty(), !parameters[2].empty(), stream.Width(), stream.Height());
-                    if (changed) { Destroy(); ready.clear(); waitingKey = true; readback.Reset(); }
+                        "startup epoch=%{public}llu bytes=%{public}zu picture=%{public}d random=%{public}d config=%{public}d%{public}d%{public}d size=%{public}dx%{public}d",
+                        static_cast<unsigned long long>(codecSequence_), unit.bytes.size(), picture, unit.randomAccess,
+                        !parameters[0].empty(), !parameters[1].empty(), !parameters[2].empty(), stream.Width(), stream.Height());
                     if (!picture) continue;
                     if (waitingKey) {
                         if (!unit.randomAccess || parameters[0].empty() || parameters[1].empty() || parameters[2].empty()) continue;
                         int width = stream.Width(), height = stream.Height();
                         if (width <= 0 || height <= 0 || width > 8192 || height > 8192) continue;
-                        if (!Create(width, height)) { ++retries; continue; }
+                        if (!Create(width, height)) {
+                            recovery.Failed(); restartEvidence("codec-create-failed"); recordRecovery();
+                            LogState("create-failed", surface);
+                            if (recovery.Paused()) break;
+                            continue;
+                        }
                         neo::Bytes prefix;
                         for (const auto &parameter : parameters) prefix.insert(prefix.end(), parameter.begin(), parameter.end());
                         prefix.insert(prefix.end(), unit.bytes.begin(), unit.bytes.end()); unit.bytes = std::move(prefix);
                         waitingKey = false; startedAt = Now();
-                        std::lock_guard<std::mutex> lock(mutex_); stats_.waitingForKey = false;
+                        { std::lock_guard<std::mutex> lock(mutex_); stats_.waitingForKey = false; }
+                        LogState("key-ready", surface);
                     }
                     ready.push_back(std::move(unit));
                 }
@@ -437,7 +505,7 @@ private:
             size_t readyBytes = 0; for (const auto &unit : ready) readyBytes += unit.bytes.size();
             if (ready.size() > 16 || readyBytes > 8 * 1024 * 1024) {
                 { std::lock_guard<std::mutex> lock(mutex_); rejected_ += ready.size(); }
-                reset();
+                reset("ready-queue-overflow");
             }
             while (codec_ && !ready.empty()) {
                 Buffer input{};
@@ -445,7 +513,7 @@ private:
                 auto unit = std::move(ready.front()); ready.pop_front();
                 auto capacity = OH_AVBuffer_GetCapacity(input.data); auto *address = OH_AVBuffer_GetAddr(input.data);
                 if (!address || unit.bytes.size() > static_cast<size_t>(std::max(capacity, 0))) {
-                    Fail("解码器输入空间不足"); ++retries; reset(); break;
+                    Fail("解码器输入空间不足"); recovery.Failed(); reset("input-buffer-too-small"); break;
                 }
                 std::memcpy(address, unit.bytes.data(), unit.bytes.size());
                 OH_AVCodecBufferAttr attr{}; lastPts = std::max(Now() * 1000, lastPts + 1);
@@ -453,9 +521,15 @@ private:
                 attr.flags = unit.randomAccess ? AVCODEC_BUFFER_FLAGS_SYNC_FRAME : AVCODEC_BUFFER_FLAGS_NONE;
                 int code = OH_AVBuffer_SetBufferAttr(input.data, &attr);
                 if (code == AV_ERR_OK) code = OH_VideoDecoder_PushInputBuffer(codec_, input.index);
-                if (code != AV_ERR_OK) { Fail("提交视频帧失败，错误码 " + std::to_string(code)); ++retries; reset(); break; }
+                if (code != AV_ERR_OK) {
+                    Fail("提交视频帧失败，错误码 " + std::to_string(code)); recovery.Failed(); reset("input-submit-failed"); break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex_); ++stats_.submitted; stats_.submittedAt = Now();
+                    if (unit.randomAccess) ++stats_.acceptedRandomAccess;
+                }
                 readback.Feed(std::move(unit), stream.Width(), stream.Height(), parameters);
-                lastInput = Now(); std::lock_guard<std::mutex> lock(mutex_); ++stats_.submitted;
+                lastInput = Now();
             }
             uint32_t ticket = 0;
             {
@@ -473,27 +547,30 @@ private:
             int64_t lastOutput;
             { std::lock_guard<std::mutex> lock(mutex_); lastOutput = stats_.decodedAt; }
             if (codec_ && lastInput > std::max(startedAt, lastOutput) && Now() - std::max(startedAt, lastOutput) > 2500) {
-                Fail("视频解码停滞，正在等待新的关键帧"); ++retries; reset();
+                Fail("视频解码停滞，正在等待新的关键帧"); recovery.Failed(); reset("decode-stall");
             }
-            if (retries >= 3) {
-                std::lock_guard<std::mutex> lock(mutex_); frames_.Clear(); stats_.running = false;
-                stats_.error = "视频恢复已暂停，请重新连接飞机或重新打开页面";
+            if (recovery.Paused()) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex_); frames_.Clear(); stats_.running = false;
+                    stats_.recoveryPaused = true; stats_.consecutiveFailures = recovery.Failures();
+                    stats_.error = "视频连续恢复失败，恢复已暂停，请重新连接飞机或重新打开页面";
+                }
+                LogState("recovery-paused", surface);
                 break;
             }
             if (Now() - lastStatsLog >= 5000) {
-                lastStatsLog = Now(); std::lock_guard<std::mutex> lock(mutex_);
-                OH_LOG_Print(LOG_APP, LOG_INFO, 0, "NeoVideo", "frames=%{public}llu decoded=%{public}llu rendered=%{public}llu queue=%{public}zu drops=%{public}llu errors=%{public}llu age=%{public}lld",
-                    static_cast<unsigned long long>(stats_.assembled), static_cast<unsigned long long>(stats_.decoded),
-                    static_cast<unsigned long long>(stats_.rendered), frames_.Size(), static_cast<unsigned long long>(frames_.Dropped()+rejected_),
-                    static_cast<unsigned long long>(stats_.errors), static_cast<long long>(stats_.renderedAt ? Now()-stats_.renderedAt : -1));
+                lastStatsLog = Now(); LogState("stats", surface);
             }
         }
         Destroy();
         if (window_) { OH_NativeWindow_DestroyNativeWindow(window_); window_ = nullptr; }
+        { std::lock_guard<std::mutex> lock(mutex_); stats_.running = false; }
+        LogState("worker-stop", surface);
     }
     std::mutex mutex_; std::condition_variable wake_; std::thread worker_;
     bool stopping_ = true, discontinuity_ = false; int32_t callbackError_ = 0;
     uint64_t pendingSurface_ = 0;
+    uint64_t codecSequence_ = 0;
     uint32_t captureSequence_ = 0, captureTicket_ = 0;
     CapturedFrame captured_;
     uint64_t rejected_ = 0;
@@ -572,12 +649,18 @@ napi_value Snapshot(napi_env env, napi_callback_info) {
     auto boolean = [&](const char *name, bool value) { napi_value v; napi_get_boolean(env, value, &v); napi_set_named_property(env, result, name, v); };
     auto age = [&](int64_t value) -> double { return value ? Now() - value : -1; };
     boolean("running", s.running); boolean("waitingForKey", s.waitingForKey);
+    boolean("recoveryPaused", s.recoveryPaused);
+    number("decoderEpoch", s.decoderEpoch); number("consecutiveFailures", s.consecutiveFailures);
+    number("parameterMask", s.parameterMask); number("randomAccessFrames", s.randomAccess);
+    number("acceptedRandomAccessFrames", s.acceptedRandomAccess);
     number("queued", queued); number("queuedBytes", bytes); number("queueDrops", dropped);
     number("assembledFrames", s.assembled); number("submittedFrames", s.submitted); number("decodedFrames", s.decoded);
     number("renderedFrames", s.rendered); number("decodeErrors", s.errors); number("suppressedParameters", s.suppressed);
     number("reorderedFrames", s.reordered); number("width", s.width); number("height", s.height);
-    number("lastAssembledAgeMs", age(s.assembledAt)); number("lastDecodedAgeMs", age(s.decodedAt)); number("lastRenderedAgeMs", age(s.renderedAt));
+    number("lastAssembledAgeMs", age(s.assembledAt)); number("lastSubmittedAgeMs", age(s.submittedAt));
+    number("lastDecodedAgeMs", age(s.decodedAt)); number("lastRenderedAgeMs", age(s.renderedAt));
     napi_value error; napi_create_string_utf8(env, s.error.c_str(), NAPI_AUTO_LENGTH, &error); napi_set_named_property(env, result, "lastError", error);
+    napi_value reason; napi_create_string_utf8(env, s.lastResetReason.c_str(), NAPI_AUTO_LENGTH, &reason); napi_set_named_property(env, result, "lastResetReason", reason);
     return result;
 }
 napi_value Init(napi_env env, napi_value exports) {
@@ -590,7 +673,8 @@ napi_value Init(napi_env env, napi_value exports) {
         {"takeFrame", nullptr, TakeFrame, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"submit", nullptr, Submit, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"snapshot", nullptr, Snapshot, nullptr, nullptr, nullptr, napi_default, nullptr}};
-    napi_define_properties(env, exports, sizeof(props)/sizeof(props[0]), props); return exports;
+    napi_define_properties(env, exports, sizeof(props)/sizeof(props[0]), props);
+    return RegisterMovieExports(env, exports);
 }
 }
 static napi_module module = {1, 0, nullptr, Init, "neovideo", nullptr, {0}};

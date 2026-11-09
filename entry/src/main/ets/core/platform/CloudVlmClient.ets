@@ -3,9 +3,8 @@ import { connection } from '@kit.NetworkKit';
 import { util } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
-import { AgentContext, AgentObservation, AgentResponse } from '../domain/AgentAction';
+import { AgentContext, AgentObservation, AgentResponse, agentObservationTimeoutMs } from '../domain/AgentAction';
 import { makeDeepSeekBody, parseDeepSeekResponse } from '../domain/DeepSeekPayload';
-import { VLM_SELECTION_TIMEOUT_MS } from '../media/VlmFrame';
 import { CloudVlmKeyStore } from './CloudVlmKeyStore';
 
 const ENDPOINT: string = 'https://api.deepseek.com/chat/completions';
@@ -32,7 +31,7 @@ export class CloudVlmClient {
     if (this.busy) throw new Error('已有云端请求处理中，请稍候');
     this.busy = true;
     let watchdog: number | undefined;
-    const deadline = observation.requestedAtMs + VLM_SELECTION_TIMEOUT_MS;
+    const deadline = observation.requestedAtMs + agentObservationTimeoutMs(observation);
     const started = Date.now();
     let abortReason = '';
     try {

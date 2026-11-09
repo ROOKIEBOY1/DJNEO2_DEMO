@@ -13,6 +13,85 @@ function rig() {
   const {NativeTaskService}=require('../entry/src/main/ets/core/domain/NativeTaskService.ets');
   return {service:new NativeTaskService(session,flight,camera),session,flight,camera,state,calls};
 }
+
+function tracked(id) {
+  return {tracking:true,overlay:[{id}],get trackingAt(){return Date.now();}};
+}
+
+test('native snapshot retains genuine recording evidence after the camera becomes idle and clears it for the next cycle',()=>{
+  const {service,state}=rig();service.startedAt=Date.now()-100;
+  service.observeProgress();assert.equal(service.snapshot().recordingSeen,false);
+  state.camera.recordingCandidate=true;state.camera.observedAtMs=Date.now();
+  service.observeProgress();assert.equal(service.snapshot().recordingSeen,true);
+  state.camera.recordingCandidate=false;service.observeProgress();
+  assert.equal(service.snapshot().recordingSeen,true,'stopping the camera must not turn a recorded task into an empty shot');
+  service.resetAfterGroundedCycle();assert.equal(service.snapshot().recordingSeen,false);
+});
+
+async function circleTargetRig() {
+  const f=rig();
+  f.flight.snapshot=()=>({takeoffSent:true,takeoffAcknowledged:true,nativeTaskMayFly:false,movementActive:false});
+  Object.assign(f.state.flight,{airborne:true,motorsOn:true,modeRaw:6});f.state.task.modeRaw=0;
+  const send=f.session.requestNative;
+  f.session.requestNative=async(r,s,i,p)=>i===0xf8?
+    (f.calls.push({r,s,i,p:Buffer.from(p).toString('hex')}),new Uint8Array([0,0x46,0x93,0x27,3,0,0,0,0x40])):send(r,s,i,p);
+  assert.equal((await f.service.prepareHover('circle',config)).ok,true);
+  f.state.flight.modeRaw=26;f.state.subject=tracked(17);
+  return f;
+}
+
+test('selected-subject circle preserves fresh tracking and starts directly without another mode switch or dolly settling',async()=>{
+  const {service,calls,state}=await circleTargetRig();const baseline=calls.length;const started=Date.now();
+  const confirmedAt=started-120;state.subject={tracking:true,overlay:[{id:17}],trackingAt:confirmedAt};
+  const result=await service.start(true,undefined,17);
+  assert.equal(result.ok,true,result.error?.message);assert.ok(Date.now()-started<2000);
+  assert.deepEqual(calls.slice(baseline),['mayfly',{r:0x92,s:0x23,i:0x13,p:'010500'}]);
+  assert.equal(service.snapshot().executionObserved,false,'a successful start reply is not execution');
+  assert.equal(service.snapshot().initialTargetTrackingAtMs,confirmedAt,'startup grace must use actual confirmed tracking time');
+  assert.equal((await service.start(true,undefined,17)).ok,false);
+  service.resetAfterGroundedCycle();assert.equal(service.snapshot().initialTargetTrackingAtMs,undefined);
+});
+
+test('selected-subject circle rejects wrong or stale tracking, task activity, landing and unowned flight before starting',async()=>{
+  const changes=[
+    f=>{f.state.subject.overlay[0].id=18;},
+    f=>{f.state.subject={tracking:true,overlay:[{id:17}],trackingAt:Date.now()-1001};},
+    f=>{f.state.subject={tracking:true,overlay:[{id:17}]};},
+    f=>{f.state.subject={tracking:true,overlay:[{id:17}],trackingAt:Date.now()+1000};},
+    f=>{f.state.subject.tracking=false;},
+    f=>{f.state.task.phaseRaw=5;f.state.task.modeRaw=5;},
+    f=>{f.state.taskAgeMs=1001;},
+    f=>{f.state.flightAgeMs=1001;},
+    f=>{f.state.cameraAgeMs=1001;},
+    f=>{f.state.camera.recordingCandidate=true;},
+    f=>{f.state.flight.modeRaw=6;},
+    f=>{f.flight.snapshot=()=>({takeoffSent:true,takeoffAcknowledged:true,landRequested:true});},
+    f=>{f.flight.snapshot=()=>({takeoffSent:true,takeoffAcknowledged:true,landSent:true});},
+    f=>{f.flight.snapshot=()=>({takeoffSent:true,takeoffAcknowledged:false});},
+    f=>{f.flight.snapshot=()=>({takeoffSent:true,takeoffAcknowledged:true,nativeTaskMayFly:true});},
+    f=>{f.flight.snapshot=()=>({takeoffSent:true,takeoffAcknowledged:true,movementActive:true});}
+  ];
+  for(const change of changes){
+    const f=await circleTargetRig();const baseline=f.calls.length;change(f);
+    assert.equal((await f.service.start(true,undefined,17)).ok,false);
+    assert.equal(f.calls.length,baseline,'invalid target cannot send mode changes or start');
+  }
+});
+
+test('selected-subject circle also honors external cancellation before its direct start',async()=>{
+  const {service,calls}=await circleTargetRig();const baseline=calls.length;
+  const token=new CancellationToken(0);token.cancel();
+  assert.equal((await service.start(true,token,17)).ok,false);assert.equal(calls.length,baseline);
+});
+
+test('existing selected-subject dolly also rejects an expired tracking timestamp before mode switching',async()=>{
+  const {service,state,flight,calls}=rig();assert.equal((await service.prepare('dolly',config)).ok,true);
+  flight.snapshot=()=>({takeoffSent:true,takeoffAcknowledged:true});
+  Object.assign(state.flight,{modeRaw:26,airborne:true,motorsOn:true});state.task.modeRaw=0;
+  state.subject={tracking:true,overlay:[{id:17}],trackingAt:Date.now()-1001};
+  const baseline=calls.length;assert.equal((await service.start(true,undefined,17)).ok,false);
+  assert.equal(calls.length,baseline);
+});
 test('follow prepares ground only, starts once, and ACK is not execution',async()=>{
   const {service,calls}=rig(); assert.equal((await service.prepare('follow',config)).ok,true);
   assert.equal((await service.start(true)).ok,true); assert.equal(service.snapshot().executionObserved,false);
@@ -27,10 +106,10 @@ test('dolly selects captured config and waits for idle video mode',async()=>{
 test('airborne dolly requires the prepared task and reselects mode before starting on the matching target', async () => {
   const { service, state, flight, calls } = rig();
   assert.equal((await service.prepare('dolly', config)).ok, true);
-  flight.snapshot = () => ({ takeoffSent: true, nativeTaskMayFly: false, movementActive: false });
+  flight.snapshot = () => ({ takeoffSent: true, takeoffAcknowledged: true, nativeTaskMayFly: false, movementActive: false });
   Object.assign(state.flight, { modeRaw: 26, airborne: true, motorsOn: true });
   state.task.modeRaw = 0;
-  state.subject = { tracking: true, overlay: [{ id: 17 }] };
+  state.subject = tracked(17);
   const baseline = calls.length;
   assert.equal((await service.start(true, undefined, 18)).ok, false);
   assert.equal(calls.length, baseline);
@@ -135,7 +214,7 @@ test('independent follow can start on a matching airborne target after explicit 
   flight.snapshot = () => ({ takeoffSent: true, takeoffAcknowledged: true });
   Object.assign(state.flight, { airborne: true, motorsOn: true, modeRaw: 6 }); state.task.modeRaw = 0;
   assert.equal((await service.prepareHover('follow', config)).ok, true);
-  state.flight.modeRaw = 26; state.subject = {tracking:true,overlay:[{id:17}]};
+  state.flight.modeRaw = 26; state.subject = tracked(17);
   assert.equal((await service.start(true, undefined, 17)).ok, true);
   assert.equal(calls.at(-1).p, '010a00');
   assert.equal(calls.filter(call => call.i === 0x13).length, 1);
@@ -154,7 +233,7 @@ test('cancelling hover preparation or losing a target during mode settling never
   g.flight.snapshot = () => ({takeoffAcknowledged:true,takeoffSent:true});
   Object.assign(g.state.flight, {airborne:true,motorsOn:true,modeRaw:6}); g.state.task.modeRaw=0;
   await g.service.prepareHover('dolly', config);
-  g.state.flight.modeRaw=26;g.state.subject={tracking:true,overlay:[{id:17}]};
+  g.state.flight.modeRaw=26;g.state.subject=tracked(17);
   const next = g.session.requestNative;
   g.session.requestNative = async (...args) => { g.state.subject.tracking=false; return next(...args); };
   assert.equal((await g.service.start(true, undefined, 17)).ok, false);

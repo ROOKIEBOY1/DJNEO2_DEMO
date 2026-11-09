@@ -9,8 +9,10 @@ import { CancellationToken, ErrorLayer, failure, OperationResult, success } from
 
 export interface NativeTaskConfig { radiusMeters: number; framing: DollyFraming; zoom: number; retreat: boolean; }
 export interface NativeTaskSnapshot {
-  kind: string; prepared: boolean; busy: boolean; startedAtMs?: number; executionObserved: boolean;
+  kind: string; prepared: boolean; busy: boolean; startedAtMs?: number; executionObserved: boolean; executionSeen: boolean;
+  recordingSeen: boolean;
   activeOrUnknown: boolean; config: NativeTaskConfig; startReply: string; stopReply: string;
+  initialTargetTrackingAtMs?: number;
 }
 export class NativeTaskService {
   private readonly session: DroneSession;
@@ -30,6 +32,7 @@ export class NativeTaskService {
   private lastProgress: string = '';
   private executionSeen: boolean = false;
   private recordingSeen: boolean = false;
+  private initialTargetTrackingAtMs?: number;
   private hoverCompletionAtMs?: number;
   constructor(session: DroneSession, flight: FlightCommandService, camera: CameraService) {
     this.session = session; this.flight = flight; this.camera = camera;
@@ -46,6 +49,7 @@ export class NativeTaskService {
     this.startReply = ''; this.stopReply = '';
     this.lastProgress = ''; this.executionSeen = false; this.recordingSeen = false;
     this.hoverCompletionAtMs = undefined;
+    this.initialTargetTrackingAtMs = undefined;
   }
 
   canCompleteForHover(): OperationResult<boolean> {
@@ -110,11 +114,13 @@ export class NativeTaskService {
   snapshot(): NativeTaskSnapshot {
     const telemetry = this.session.snapshot().telemetry; const task = telemetry.task;
     const execution = this.kind === 'circle' ? '0505000100' : this.kind === 'follow' ? '050a000100' : '050d000100';
-    return { kind: this.kind, prepared: this.prepared, busy: this.busy, startedAtMs: this.startedAt,
+    return { kind: this.kind, prepared: this.prepared, busy: this.busy, startedAtMs: this.startedAt, executionSeen: this.executionSeen,
+      recordingSeen: this.recordingSeen,
       executionObserved: task !== undefined && telemetry.taskAgeMs !== undefined && telemetry.taskAgeMs <= 1000 &&
         this.startedAt !== undefined && task.observedAtMs >= this.startedAt && task.payloadHex === execution,
       activeOrUnknown: this.activeOrUnknown(),
       config: { radiusMeters: this.config.radiusMeters, framing: this.config.framing, zoom: this.config.zoom, retreat: this.config.retreat },
+      initialTargetTrackingAtMs: this.initialTargetTrackingAtMs,
       startReply: this.startReply, stopReply: this.stopReply };
   }
   async prepareHover(kind: NativeTaskKind, config: NativeTaskConfig, external?: CancellationToken): Promise<OperationResult<boolean>> {
@@ -160,7 +166,9 @@ export class NativeTaskService {
     try {
       this.ensureReady(token, external, selectedTarget);
       if (this.kind === 'dolly') this.ensureVideoMode();
-      if (selectedTarget !== undefined) {
+      // The original selected-subject Circle trial starts directly from its live
+      // mode-26 lock. Rewriting the mode here would risk replacing that target.
+      if (selectedTarget !== undefined && this.kind !== 'circle') {
         const selection = nativeSelection(this.kind);
         validateNativeRequest(this.kind, 0x17, 3, 0xf9, selection);
         const reply = await this.session.requestNative(0x17, 3, 0xf9, selection, 2000, token);
@@ -175,6 +183,10 @@ export class NativeTaskService {
         this.ensureReady(token, external, selectedTarget);
         if (this.kind === 'dolly') this.ensureVideoMode();
       }
+      // Retain the actual final tracking evidence before startup can briefly change
+      // the reporting channel. An ACK or the current clock is not target evidence.
+      this.initialTargetTrackingAtMs = selectedTarget === undefined ? undefined :
+        this.session.snapshot().telemetry.subject?.trackingAt;
       this.prepared = false; this.startedAt = Date.now(); this.used.push(this.kind);
       this.lastProgress = ''; this.executionSeen = false; this.recordingSeen = false;
       this.hoverCompletionAtMs = undefined;
@@ -220,11 +232,17 @@ export class NativeTaskService {
     }
     if (selectedTarget !== undefined) {
       const subject = observed.subject;
-      if (!['dolly', 'follow'].includes(this.kind) || !flight.takeoffSent || flight.nativeTaskMayFly || flight.movementActive ||
+      const trackingAt = subject?.trackingAt;
+      const trackingAge = Date.now() - (trackingAt ?? -Infinity);
+      if (!['dolly', 'follow', 'circle'].includes(this.kind) || !flight.takeoffSent || !flight.takeoffAcknowledged ||
+        flight.nativeTaskMayFly || flight.movementActive ||
         !taskFresh || observed.task?.phaseRaw !== 0 || observed.task?.modeRaw !== 0 ||
         (observed.flightAgeMs ?? Infinity) > 1000 || observed.flight?.modeRaw !== 26 ||
         !observed.flight.airborne || !observed.flight.motorsOn || subject?.tracking !== true ||
-        subject.overlay.length !== 1 || subject.overlay[0].id !== selectedTarget) {
+        subject.overlay.length !== 1 || subject.overlay[0].id !== selectedTarget ||
+        !Number.isFinite(trackingAge) || trackingAge < 0 || trackingAge > 1000 ||
+        (this.kind === 'circle' && ((observed.cameraAgeMs ?? Infinity) > 1000 ||
+          observed.camera?.recordingCandidate !== false))) {
         throw new Error('空中任务需要新鲜的飞机跟踪框、普通起飞和空闲任务状态');
       }
       return;

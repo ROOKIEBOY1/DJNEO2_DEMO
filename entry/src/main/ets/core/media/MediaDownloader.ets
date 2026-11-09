@@ -5,6 +5,7 @@ import { socket } from '@kit.NetworkKit';
 import { DroneWifiSelection } from '../platform/DroneUdpChannel';
 import { CancellationToken } from '../domain/OperationResult';
 import { MediaEntry } from './MediaDirectory';
+import { hilog } from '@kit.PerformanceAnalysisKit';
 
 const HOST: string = '192.168.2.1';
 const MAXIMUM_MEDIA_BYTES: number = 512 * 1024 * 1024;
@@ -15,6 +16,12 @@ interface HttpResponse {
   body: Uint8Array;
 }
 
+export function interruptedMediaTransfer(message: string): Error {
+  const error = new Error(message); error.name = 'NeoMediaTransferInterrupted'; return error;
+}
+type BoundMediaRequest = (selection: DroneWifiSelection, target: string, range: string | undefined,
+  token?: CancellationToken) => Promise<HttpResponse>;
+
 export interface MediaDownloadResult {
   path: string;
   size: number;
@@ -24,6 +31,25 @@ export interface MediaDownloadResult {
 }
 
 export class MediaDownloader {
+  private request: BoundMediaRequest;
+  constructor(request: BoundMediaRequest = requestBound) { this.request = request; }
+
+  private async readRange(selection: DroneWifiSelection, target: string, range: string | undefined,
+    token?: CancellationToken): Promise<HttpResponse> {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      checkCancelled(token);
+      try { return await this.request(selection, target, range, token); }
+      catch (error) {
+        checkCancelled(token);
+        if (!(error instanceof Error) || error.name !== 'NeoMediaTransferInterrupted' || attempt === 3) {
+          throw error instanceof Error ? error : new Error('媒体传输失败');
+        }
+        hilog.warn(0, 'NeoMedia', '媒体连接中断，重试当前范围 %{public}s 第%{public}d次', range ?? '完整照片', attempt);
+        await new Promise<void>((resolve: () => void) => setTimeout(resolve, attempt * 250));
+      }
+    }
+    throw new Error('媒体传输重试已用尽');
+  }
   async download(entry: MediaEntry, outputDirectory: string, selection: DroneWifiSelection,
     token?: CancellationToken): Promise<MediaDownloadResult> {
     validateEntry(entry);
@@ -52,7 +78,7 @@ export class MediaDownloader {
       const start = intervals[index][0];
       const end = intervals[index][1];
       const range = entry.kind === 'video' ? `bytes=${start}-${end - 1}` : undefined;
-      const response = await requestBound(selection, target, range, token);
+      const response = await this.readRange(selection, target, range, token);
       if (response.status !== (entry.kind === 'video' ? 206 : 200)) {
         throw new Error('Unexpected media HTTP status; redirects are not followed');
       }
@@ -136,7 +162,7 @@ async function requestBound(selection: DroneWifiSelection, target: string, range
   };
   const armIdleTimeout = (): void => {
     clearIdleTimeout();
-    timer = setTimeout(() => finishError(new Error('Media HTTP request timed out after 5 seconds without data')), 5000);
+    timer = setTimeout(() => finishError(interruptedMediaTransfer('Media HTTP request timed out after 5 seconds without data')), 5000);
   };
   const finishError = (error: Error): void => {
     if (!completed) {
@@ -198,10 +224,10 @@ async function requestBound(selection: DroneWifiSelection, target: string, range
       finishError(error instanceof Error ? error : new Error(String(error)));
     }
   });
-  tcp.on('error', (error: Error) => finishError(error));
+  tcp.on('error', (error: Error) => finishError(interruptedMediaTransfer(error.message)));
   tcp.on('close', () => {
     if (!completed) {
-      finishError(new Error('TCP connection closed before the complete media response arrived'));
+      finishError(interruptedMediaTransfer('TCP connection closed before the complete media response arrived'));
     }
   });
   try {

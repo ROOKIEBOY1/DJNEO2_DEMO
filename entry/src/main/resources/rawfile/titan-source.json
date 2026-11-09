@@ -1,0 +1,16 @@
+{
+  "title": "Titan",
+  "artist": "Scott Buckley",
+  "published": "2018-06-06",
+  "source": "https://www.scottbuckley.com.au/library/titan/",
+  "download": "https://www.scottbuckley.com.au/library/wp-content/uploads/2018/06/sb_titan.mp3",
+  "retrieved": "2026-11-06",
+  "license": "CC BY 4.0",
+  "licenseUrl": "https://creativecommons.org/licenses/by/4.0/",
+  "legalcodeUrl": "https://creativecommons.org/licenses/by/4.0/legalcode",
+  "attribution": "'Titan' by Scott Buckley - released under CC-BY 4.0. www.scottbuckley.com.au",
+  "modifications": "Original bundled MP3 unchanged. Exported movies: decoded, converted to 48 kHz stereo, looped/trimmed to movie duration, faded in/out for up to one second, AAC-LC encoded; source-video audio replaced.",
+  "publicationNote": "Preserve the attribution in the video description when publishing on YouTube; retain credit, source, license link and modification notice when sharing.",
+  "originalBytes": 7034419,
+  "sha256": "fb921a09cc6181228b14945c7a6b90b50a83f4f38a37644a383bf7c70ea83729"
+}
