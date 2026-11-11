@@ -55,11 +55,16 @@ export class SubjectObservation {
     const view = new DataView(p.buffer, p.byteOffset, p.byteLength);
     if (frame.commandId === 0xbc) {
       this.detection = undefined;
-      if (p.length < 12 || p[0] !== 2 || p[11] > 2 || p.length !== 12 + 12 * p[11]) return;
+      // Accept complete 12-byte record tables; this does not establish the device's detection capacity.
+      if (p.length < 12 || p[0] !== 2 || p.length !== 12 + 12 * p[11]) return;
       const boxes: SubjectBox[] = [];
+      const seenIds: Set<number> = new Set<number>();
       try {
         for (let offset = 12; offset < p.length; offset += 12) {
-          boxes.push(box(view.getUint16(offset, true), view.getUint16(offset + 4, true) / 10000,
+          const id = view.getUint16(offset, true);
+          if (id > 255 || seenIds.has(id)) return;
+          seenIds.add(id);
+          boxes.push(box(id, view.getUint16(offset + 4, true) / 10000,
             view.getUint16(offset + 6, true) / 10000, view.getUint16(offset + 8, true) / 10000,
             view.getUint16(offset + 10, true) / 10000));
         }

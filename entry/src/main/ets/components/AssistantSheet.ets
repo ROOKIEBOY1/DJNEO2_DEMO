@@ -1,14 +1,15 @@
 import { AppRuntime, ConsoleSnapshot } from '../core/domain/AppController';
 import { AssistantConversation, AssistantMessage } from '../core/domain/AssistantConversation';
+import { AssistantAutoScroll, AssistantScrollContent } from '../core/domain/AssistantAutoScroll';
 import { assistantProgress } from '../core/domain/AssistantProgress';
-import { flightPlanPresentation, taskProgressPresentation, videoResultReady, videoResultPresentation, flightResultMetrics, ResultMetric } from '../core/domain/AssistantFlightPresentation';
+import { flightPlanPresentation, taskProgressPresentation, videoResultReady, videoResultPresentation, flightResultMetrics, ResultMetric, subjectTaskSnapshot, subjectConfirmationLabel } from '../core/domain/AssistantFlightPresentation';
 import { PreviewRecordingClock } from '../core/domain/PreviewRecordingClock';
 import { SubjectBox } from '../core/domain/SubjectObservation';
-import { subjectFramePresentation, showSubjectFrame } from '../core/domain/SubjectFramePresentation';
+import { selectedSubjectFrames } from '../core/domain/SubjectFramePresentation';
 import { common } from '@kit.AbilityKit';
 import { promptAction } from '@kit.ArkUI';
 import { fileUri } from '@kit.CoreFileKit';
-import { TITAN_CREDIT, TITAN_SOURCE, TITAN_LICENSE, TITAN_CHANGES } from '../core/platform/NativeMovieExport';
+import { MOVIE_MUSIC_NAME, MOVIE_MUSIC_DESCRIPTION } from '../core/platform/NativeMovieExport';
 
 class AssistantSurfaceController extends XComponentController {
   onSurfaceCreated(id: string): void { AppRuntime.controller().video.attach(id); }
@@ -29,6 +30,10 @@ export struct AssistantSheet {
   private controller = AppRuntime.controller();
   private surface = new AssistantSurfaceController();
   private scroller: Scroller = new Scroller();
+  private autoScroll: AssistantAutoScroll = new AssistantAutoScroll();
+  private scrollTimer?: number;
+  private scrollEpoch: number = 0;
+  private appeared: boolean = false;
   private resultPlayer: VideoController = new VideoController();
   private timer?: number;
   private epoch: number = 0;
@@ -45,7 +50,6 @@ export struct AssistantSheet {
   @State mediaNote: string = '';
   @State savedMediaGroup: string = '';
   @State showMovie: boolean = false;
-  @State subjectConfirmed: boolean = false;
   @State resultPlaying: boolean = false;
   @State resultHasStarted: boolean = false;
   @State resultFullscreen: boolean = false;
@@ -53,6 +57,7 @@ export struct AssistantSheet {
   private seenMovieOutput: string = '';
 
   aboutToAppear(): void {
+    this.appeared = true;
     this.messages = this.conversation.snapshot().messages;
     this.updateRecordingClock();
     this.updateMovieResult();
@@ -61,6 +66,7 @@ export struct AssistantSheet {
       this.updateRecordingClock();
       this.updateMovieResult();
       if (assistantProgress(this.state, this.status).busy) this.progressAngle += 45;
+      this.updateAutoScroll();
     }, 250);
   }
   private updateRecordingClock(): void {
@@ -68,12 +74,48 @@ export struct AssistantSheet {
     this.recordingTime = clock.label; this.recordingRunning = clock.recording;
   }
   aboutToDisappear(): void {
+    this.appeared = false; this.stopAutoScroll();
     if (this.timer !== undefined) clearInterval(this.timer);
     this.timer = undefined; this.epoch++;
     this.stopResultPlayback();
     if (this.processing || this.listening) {
       this.cancelProcessing(); this.controller.stopSubjectDescription().catch(() => {});
     }
+  }
+  private startAutoScroll(): void {
+    if (!this.appeared || !this.expanded) return;
+    this.stopAutoScroll();
+    this.scrollEpoch = this.autoScroll.start();
+    this.updateAutoScroll();
+  }
+  private stopAutoScroll(): void {
+    if (this.scrollTimer !== undefined) clearTimeout(this.scrollTimer);
+    this.scrollTimer = undefined; this.autoScroll.stop();
+  }
+  private updateAutoScroll(delay: number = 32): void {
+    if (!this.appeared || !this.expanded) { this.stopAutoScroll(); return; }
+    const content: AssistantScrollContent = {
+      state: this.state, messages: this.messages, listening: this.listening, processing: this.processing,
+      accepting: this.accepting, status: this.status, mediaNote: this.mediaNote,
+      showingMovie: this.showingMovie(), savedMediaGroup: this.savedMediaGroup
+    };
+    if (this.autoScroll.observe(content)) this.queueAutoScroll(delay);
+  }
+  private scrollAreaChanged(): void {
+    this.updateAutoScroll(0);
+    this.queueAutoScroll(0);
+  }
+  private queueAutoScroll(delay: number = 32): void {
+    if (!this.expanded || !this.autoScroll.hasPending()) return;
+    if (this.scrollTimer !== undefined) return;
+    const epoch = this.scrollEpoch;
+    // Area callbacks settle size-changing updates; this fallback also handles equal-height button/text changes.
+    this.scrollTimer = setTimeout(() => {
+      if (epoch !== this.scrollEpoch) return;
+      this.scrollTimer = undefined;
+      if (!this.expanded) { this.stopAutoScroll(); return; }
+      if (this.autoScroll.takePending(epoch)) this.scroller.scrollEdge(Edge.Bottom);
+    }, delay);
   }
   private cancelProcessing(): void {
     const state = this.controller.snapshot();
@@ -88,7 +130,6 @@ export struct AssistantSheet {
       this.listening = false; this.processing = false; this.status = '已停止本次请求'; return;
     }
     if (this.accepting) return;
-    this.subjectConfirmed = false;
     this.stopResultPlayback(); this.mediaNote = '';
     const epoch = ++this.epoch; this.listening = true; this.status = '正在打开麦克风…';
     try {
@@ -96,7 +137,7 @@ export struct AssistantSheet {
       if (epoch !== this.epoch) return;
       this.listening = false; this.processing = true;
       this.conversation.submit(text); this.messages = this.conversation.snapshot().messages;
-      this.status = '正在理解你的拍摄需求…'; this.scroller.scrollEdge(Edge.Bottom);
+      this.status = '正在理解你的拍摄需求…';
       const local = await this.controller.executeLocalFlightVoice(text);
       if (epoch !== this.epoch) return;
       if (local !== undefined) { this.status = local.message; return; }
@@ -108,7 +149,6 @@ export struct AssistantSheet {
     } finally { if (epoch === this.epoch) { this.listening = false; this.processing = false; } }
   }
   private async confirmSubject(): Promise<void> {
-    this.subjectConfirmed = true;
     await this.confirmAction('subject');
   }
   private async executePlan(): Promise<void> {
@@ -123,12 +163,14 @@ export struct AssistantSheet {
     if (this.processing || this.listening || this.accepting) return;
     const epoch = ++this.epoch; this.processing = true;
     try {
-      const result = action === 'subject' ? await this.controller.confirmGroundDolly() : action === 'execute' ?
-        await this.controller.executeGroundDolly() : await this.controller.confirmAgentAction();
+      const pending = action === 'subject' ? this.controller.confirmSubjectTask() : action === 'execute' ?
+        this.controller.executeSubjectPlan() : this.controller.confirmAgentAction();
+      this.state = this.controller.snapshot();
+      const result = await pending;
       if (epoch === this.epoch) this.status = result.message;
     } catch (error) {
       if (epoch === this.epoch) this.status = error instanceof Error ? error.message : '拍摄启动失败';
-    } finally { if (epoch === this.epoch) this.processing = false; }
+    } finally { if (epoch === this.epoch) { this.processing = false; this.state = this.controller.snapshot(); } }
   }
   private land(): void {
     this.epoch++; this.processing = false; this.listening = false;
@@ -136,7 +178,7 @@ export struct AssistantSheet {
     this.controller.land().catch(() => {}); this.status = '正在请求降落…';
   }
   private closeDialogue(): void {
-    this.epoch++; this.stopResultPlayback();
+    this.epoch++; this.stopAutoScroll(); this.stopResultPlayback();
     if (this.processing || this.listening) {
       this.cancelProcessing(); this.controller.stopSubjectDescription().catch(() => {});
       this.processing = false; this.listening = false; this.status = '已停止本次请求';
@@ -187,13 +229,7 @@ export struct AssistantSheet {
     return split < 0 ? line : line.slice(split + 1);
   }
   private subjectFrames(): SubjectBox[] {
-    const frames: SubjectBox[] = [];
-    if (!showSubjectFrame(this.state.groundDolly.stage, this.subjectConfirmed)) return frames;
-    for (const source of this.state.selectedSubjectOverlay) {
-      const frame = subjectFramePresentation(source);
-      if (frame !== undefined) frames.push(frame);
-    }
-    return frames;
+    return selectedSubjectFrames(subjectTaskSnapshot(this.state), this.state.selectedSubjectOverlay);
   }
   private selectResult(index: number): void {
     this.stopResultPlayback(); this.showMovie = false; this.mediaNote = ''; this.controller.selectAgentMedia(index);
@@ -227,7 +263,7 @@ export struct AssistantSheet {
     this.stopResultPlayback(); this.showMovie = !this.showMovie; this.mediaNote = '';
   }
   private movieProgressLabel(): string {
-    if (this.state.moviePreparing) return '小艺正在准备Titan配乐…';
+    if (this.state.moviePreparing) return '小艺正在准备配乐…';
     if (this.state.movie.stage === 'probing') return '小艺正在整理拍摄素材…';
     if (this.state.movie.stage === 'rendering') return '小艺正在添加配乐与淡入淡出…';
     if (this.state.movie.stage === 'finalizing') return '小艺正在完成成片导出…';
@@ -252,7 +288,7 @@ export struct AssistantSheet {
     Column({ space: 10 }) {
       Column({ space: 5 }) {
         Row({ space: 7 }) {
-          if (this.state.groundDolly.stage === 'plan' || this.resultVisible()) {
+          if (subjectTaskSnapshot(this.state).stage === 'plan' || this.resultVisible()) {
             Text('✓').fontSize(19).fontColor('#6C7882').width(19)
           } else {
             Image($r('app.media.assistant_progress_orbit')).width(19).height(19)
@@ -287,13 +323,13 @@ export struct AssistantSheet {
         this.state.videoPreview.stats.width / this.state.videoPreview.stats.height : 16 / 9)
         .backgroundColor('#17171C').borderRadius(18).clip(true)
         .visibility(this.resultVisible() ? Visibility.None : Visibility.Visible)
-      if (this.state.groundDolly.stage === 'confirm') {
-          Button('确认拍摄主体').width('100%').height(44).fontSize(15).fontWeight(FontWeight.Medium)
+      if (subjectTaskSnapshot(this.state).stage === 'confirm') {
+          Button(subjectConfirmationLabel(this.state)).width('100%').height(44).fontSize(15).fontWeight(FontWeight.Medium)
             .backgroundColor('#6559E8').borderRadius(22)
             .enabled(!this.state.busy && !this.listening && !this.processing && !this.accepting &&
-              this.state.selectedSubjectOverlay.length === 1).onClick(() => this.confirmSubject())
+              this.subjectFrames().length === 1).onClick(() => this.confirmSubject())
       }
-      if (this.state.groundDolly.stage === 'plan') this.flightPlanCard()
+      if (subjectTaskSnapshot(this.state).stage === 'plan') this.flightPlanCard()
       if (taskProgressPresentation(this.state).visible) this.taskProgressCard()
       if (this.state.agentConfirmation.length > 0) {
         Text(this.state.agentConfirmation).fontSize(12).fontColor('#777780').width('100%')
@@ -323,7 +359,7 @@ export struct AssistantSheet {
   flightPlanCard() {
     Column({ space: 3 }) {
       Text(flightPlanPresentation(this.state).title).fontSize(16).fontWeight(FontWeight.Bold).fontColor('#292D34').margin({ bottom: 5 })
-      if (this.state.groundDolly.plan?.recipe !== 'dolly_circle') {
+      if (subjectTaskSnapshot(this.state).plan?.recipe !== 'dolly_circle') {
         Text(flightPlanPresentation(this.state).detail).fontSize(13).fontColor('#626870').lineHeight(19).margin({ bottom: 5 })
       }
       ForEach(flightPlanPresentation(this.state).lines, (line: string) => {
@@ -407,7 +443,8 @@ export struct AssistantSheet {
           }.width('100%').justifyContent(FlexAlign.Center)
         }
       Column({ space: 3 }) {
-        Text(this.showingMovie() ? '成片与飞行任务结果' : videoResultPresentation(this.state).title)
+        Text(this.showingMovie() ? (subjectTaskSnapshot(this.state).plan?.action === 'record_start' ?
+          '成片与录像结果' : '成片与飞行任务结果') : videoResultPresentation(this.state).title)
           .fontSize(16).fontWeight(FontWeight.Bold).fontColor('#292D34').margin({ bottom: 5 })
         ForEach(flightResultMetrics(this.state), (metric: ResultMetric) => {
           Text() {
@@ -416,7 +453,7 @@ export struct AssistantSheet {
           }.fontSize(13).fontColor('#515860').lineHeight(19).width('100%')
         }, (metric: ResultMetric) => metric.label)
         if (this.showingMovie()) {
-          Text(`配乐 Titan · ${(this.state.movie.durationMs / 1000).toFixed(1)} 秒`).fontSize(11).fontColor('#7D8190').margin({ top: 4 })
+          Text(`配乐 ${MOVIE_MUSIC_NAME} · ${(this.state.movie.durationMs / 1000).toFixed(1)} 秒`).fontSize(11).fontColor('#7D8190').margin({ top: 4 })
         }
         if (this.state.movie.stage === 'completed') {
           Button(this.showingMovie() ? '查看原片' : '查看成片').height(32).fontSize(12).fontColor('#8C5989')
@@ -438,7 +475,7 @@ export struct AssistantSheet {
           .onClick(() => this.saveVideos())
       }.width('100%')
       if (this.state.movie.stage === 'completed') {
-        Text(`${TITAN_CREDIT}\n${TITAN_SOURCE}\n${TITAN_LICENSE}\n${TITAN_CHANGES}`)
+        Text(MOVIE_MUSIC_DESCRIPTION)
           .fontSize(10).fontColor('#8A8490').lineHeight(16).width('100%').copyOption(CopyOptions.LocalDevice)
       }
       if (this.mediaNote.length > 0) Text(this.mediaNote).fontSize(12).fontColor('#8B949C').lineHeight(19).width('100%')
@@ -459,7 +496,11 @@ export struct AssistantSheet {
         Text('小艺').fontSize(19).fontWeight(FontWeight.Medium).fontColor('#202027')
           .gesture(LongPressGesture({ repeat: false, duration: 1200 }).onAction(() => this.onSettings()))
         Text('无人机拍摄').fontSize(11).fontColor('#A0A0A8').margin({ left: 7 }).layoutWeight(1).maxLines(1)
-        Text(this.state.session.phase === 'ready' ? '已连接' : '连接飞机').fontSize(11).fontColor('#85858F')
+        Button(this.state.connectionRecovering ? '连接准备中' : this.state.connectionReady ?
+          (this.state.connectionFrameReady ? '已连接' : '已连接 · 等待画面') : '连接飞机', { type: ButtonType.Normal }).fontSize(12)
+          .fontColor(this.state.connectionReady ? '#48765A' : '#B94860')
+          .backgroundColor(this.state.connectionReady ? '#E4F4E8' : '#FFF0F2')
+          .height(30).padding({ left: 10, right: 10 }).borderRadius(15)
           .onClick(() => this.controller.ensureReadyConnection())
         Button('降落', { type: ButtonType.Normal }).fontSize(12).fontColor('#B94860').backgroundColor('#FFF0F2')
           .height(30).padding({ left: 10, right: 10 }).borderRadius(15).margin({ left: 10 }).onClick(() => this.land())
@@ -481,8 +522,12 @@ export struct AssistantSheet {
           if (this.messages.length > 0 || this.resultVisible()) this.liveCard()
           if (this.messages.length === 0 && this.status.length > 0) Text(this.status).fontSize(11).fontColor('#9696A0').width('100%')
         }.width('100%').padding({ left: 22, right: 22, bottom: 16 }).alignItems(HorizontalAlign.Start)
+          .onAreaChange(() => this.scrollAreaChanged())
       }.layoutWeight(1).width('100%').scrollable(ScrollDirection.Vertical).scrollBar(BarState.Auto)
         .align(Alignment.TopStart)
+        .onAreaChange(() => this.scrollAreaChanged())
+        .onAppear(() => this.startAutoScroll())
+        .onDisAppear(() => this.stopAutoScroll())
       }.width('100%').layoutWeight(1).padding({ bottom: 8 }).borderRadius(30).clip(true)
         .backgroundColor('#B3F0F1F3').backgroundBlurStyle(BlurStyle.COMPONENT_REGULAR)
         .border({ width: 0.7, color: '#E8FFFFFF' }).shadow({ radius: 16, color: '#14212D3A', offsetY: 3 })

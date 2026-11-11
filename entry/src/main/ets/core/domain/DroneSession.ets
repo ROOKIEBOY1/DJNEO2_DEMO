@@ -51,6 +51,7 @@ export interface DroneSessionSnapshot {
   sentDatagrams: number;
   lastUdpPeer: string;
   downlinkAgeMs?: number;
+  controlDownlinkAgeMs?: number;
   videoAgeMs?: number;
   lastError: string;
   transport?: ReliableTransportSnapshot;
@@ -93,6 +94,7 @@ export class DroneSession {
   private receivedPackets: number = 0;
   private handshakeAttemptValue: number = 0;
   private lastReceivedAt?: number;
+  private lastControlReceivedAt?: number;
   private lastVideoAt?: number;
   private lastError: string = '';
   private listener?: SessionListener;
@@ -139,13 +141,34 @@ export class DroneSession {
     if (this.phaseValue !== SessionPhase.DISCONNECTED && this.phaseValue !== SessionPhase.FAILED) {
       return failure(ErrorLayer.NETWORK, 'SESSION_ACTIVE', 'A session is already active');
     }
+    let connectionGeneration = this.generation;
+    const cancelled = (): OperationResult<DroneSessionSnapshot> =>
+      failure(ErrorLayer.NETWORK, 'CONNECT_CANCELLED', '连接过程中会话已变化或断开，请重新连接');
     try {
+      // A failed session still owns its socket and routing reservation. Release
+      // them before replacing the store, otherwise its process-wide lock leaks.
+      if (this.phaseValue === SessionPhase.FAILED) {
+        this.phaseValue = SessionPhase.CLOSING;
+        this.emit();
+        const cleanupGeneration = this.generation + 1;
+        connectionGeneration = cleanupGeneration;
+        await this.cleanup();
+        if (this.generation !== cleanupGeneration || this.phaseValue !== SessionPhase.CLOSING) {
+          return cancelled();
+        }
+      }
       this.phaseValue = SessionPhase.SELECTING_NETWORK;
       this.emit();
       this.selection = selection;
       this.profileId = profile.id;
       this.generation++;
       const generation = this.generation;
+      connectionGeneration = generation;
+      const requireCurrentHandshake = (): void => {
+        if (generation !== this.generation || this.phaseValue !== SessionPhase.HANDSHAKING) {
+          throw new Error(this.lastError || '连接过程中会话已变化或断开');
+        }
+      };
       this.routing = new RoutingSequenceStore(profile.directory, profile.registration.routingIdentity);
       this.routing.open();
       this.telemetry = new TelemetryStore();
@@ -153,6 +176,7 @@ export class DroneSession {
       this.receivedPackets = 0;
       this.handshakeAttemptValue = 0;
       this.lastReceivedAt = undefined;
+      this.lastControlReceivedAt = undefined;
       this.lastVideoAt = undefined;
       this.deviceVerified = false;
       this.lastError = '';
@@ -172,91 +196,138 @@ export class DroneSession {
       this.phaseValue = SessionPhase.HANDSHAKING;
       this.emit();
       const packetHandler = (packet: Uint8Array, receivedAtMs: number): void => {
-        if (generation === this.generation && profile.id === this.profileId) this.onPacket(packet, receivedAtMs);
+        if (generation !== this.generation || profile.id !== this.profileId) return;
+        const handshakeWasMatched = this.handshakeMatched;
+        this.onPacket(packet, receivedAtMs);
+        if (!handshakeWasMatched && this.handshakeMatched) {
+          // The initial video/registration burst can arrive before connect()
+          // resumes. Preserve its ACK cursor from the very next callback.
+          this.transport = new ReliableTransport(this.session, this.videoSeed);
+          this.registration = new RegistrationExchange(receivedAtMs, profile.registration);
+        }
       };
       const errorHandler = (message: string): void => {
-        this.fail(message);
+        if (generation === this.generation && profile.id === this.profileId) this.fail(message);
       };
       await this.channel.open(this.selection, packetHandler, errorHandler);
+      requireCurrentHandshake();
       const request = buildHandshake(this.session, this.videoSeed);
       for (let attempt = 0; attempt < 60 && !this.handshakeMatched; attempt++) {
         this.handshakeAttemptValue = attempt + 1;
         this.emit();
         await this.channel.send(request);
+        requireCurrentHandshake();
         // The aircraft associates its reply with the original UDP return port.
         // Match Python FlightController.connect(): keep one socket for all retries,
         // and start the tick loop as soon as the matching reply arrives.
         const retryDeadline = Date.now() + 550;
         while (Date.now() < retryDeadline && !this.handshakeMatched) {
           await delay(50);
+          requireCurrentHandshake();
         }
       }
       if (!this.handshakeMatched) {
         throw new Error('No matching 15-byte aircraft handshake reply');
       }
-      this.transport = new ReliableTransport(this.session, this.videoSeed);
-      this.registration = new RegistrationExchange(Date.now(), profile.registration);
       this.phaseValue = SessionPhase.REGISTERING;
       this.tickTimer = setInterval(() => {
-        this.tick().catch((error: Error) => this.fail(error.message));
+        if (generation !== this.generation) return;
+        this.tick().catch((error: Error) => {
+          if (generation === this.generation) this.fail(error.message);
+        });
       }, 60);
       this.emit();
       return success(this.snapshot());
     } catch (error) {
+      if (connectionGeneration !== this.generation) return cancelled();
       const message = errorMessage(error);
       this.lastError = message;
-      this.phaseValue = SessionPhase.FAILED;
+      this.phaseValue = SessionPhase.CLOSING;
+      const cleanupGeneration = this.generation + 1;
       await this.cleanup();
+      if (this.generation !== cleanupGeneration) return cancelled();
       this.phaseValue = SessionPhase.DISCONNECTED;
       this.emit();
       return failure(ErrorLayer.NETWORK, 'CONNECT_FAILED', message);
     }
   }
 
-  async initialize(timeoutMs: number = 8000): Promise<OperationResult<DroneSessionSnapshot>> {
-    if (timeoutMs <= 0 || timeoutMs > 15000 || this.transport === undefined) {
+  async initialize(timeoutMs: number = 8000,
+    previewReady?: () => boolean): Promise<OperationResult<DroneSessionSnapshot>> {
+    if (timeoutMs <= 0 || timeoutMs > 15000 || this.transport === undefined ||
+      (this.phaseValue !== SessionPhase.REGISTERING && this.phaseValue !== SessionPhase.READY)) {
       return failure(ErrorLayer.HANDSHAKE_REGISTRATION, 'INVALID_INITIALIZATION',
         'Initialization requires a reliable connected session and a bounded timeout');
     }
+    const generation = this.generation;
+    const session = this.session;
+    const transport = this.transport;
+    const current = (): boolean => generation === this.generation && session === this.session &&
+      transport === this.transport && this.phaseValue === SessionPhase.REGISTERING;
+    const cancelled = (): OperationResult<DroneSessionSnapshot> =>
+      failure(ErrorLayer.HANDSHAKE_REGISTRATION, 'INITIALIZATION_CANCELLED',
+        '连接准备过程中会话已变化或断开，请重新连接');
+    this.phaseValue = SessionPhase.REGISTERING;
+    this.deviceVerified = false;
+    this.emit();
     const deadline = Date.now() + timeoutMs;
     try {
       // Python connect() blocks for prepare_seconds before the caller may initialize,
       // so the aircraft always sees the full short initial frame phase before queries.
-      while (Date.now() < deadline &&
-        (this.lastReceivedAt === undefined || Date.now() - this.lastReceivedAt > 1000 ||
+      while (current() && Date.now() < deadline &&
+        (this.lastControlReceivedAt === undefined || Date.now() - this.lastControlReceivedAt > 1000 ||
           Date.now() < this.shortPhaseUntil)) {
-        await delay(50);
+        await delay(Math.min(50, Math.max(1, deadline - Date.now())));
       }
-      if (this.lastReceivedAt === undefined || Date.now() - this.lastReceivedAt > 1000) {
-        return failure(ErrorLayer.HANDSHAKE_REGISTRATION, 'INITIALIZATION_TIMEOUT',
-          'No fresh reliable aircraft downlink arrived after the handshake');
+      if (!current()) return cancelled();
+      if (Date.now() < deadline) {
+        await this.probeStartupQueries(Math.min(500, Math.max(1, deadline - Date.now())));
       }
-      await this.probeStartupQueries(Math.min(500, timeoutMs));
+      if (!current()) return cancelled();
       while (Date.now() < deadline) {
-        if (!this.deviceVerified) {
+        if (!current()) return cancelled();
+        if (!this.deviceVerified && this.lastControlReceivedAt !== undefined &&
+          Date.now() - this.lastControlReceivedAt <= 1000) {
           const remaining = Math.max(1, deadline - Date.now());
-          await this.queryDevice(Math.min(1000, remaining));
+          const verified = await this.queryDevice(Math.min(1000, remaining));
+          if (!current()) return cancelled();
+          this.deviceVerified = verified;
         }
-        if (this.deviceVerified && this.lastReceivedAt !== undefined && Date.now() - this.lastReceivedAt <= 1000) {
+        if (!current()) return cancelled();
+        if (Date.now() < deadline && this.startupMissing().length === 0 &&
+          (previewReady === undefined || previewReady())) {
           this.phaseValue = SessionPhase.READY;
+          this.lastError = '';
           this.emit();
           return success(this.snapshot());
         }
-        await delay(100);
+        await delay(Math.min(50, Math.max(1, deadline - Date.now())));
       }
+      if (!current()) return cancelled();
+      const missing = this.startupMissing();
+      if (previewReady !== undefined && !previewReady()) missing.push('实时画面');
+      if (missing.length === 0) missing.push('设备就绪确认');
+      this.lastError = `连接准备超时：仍在等待${missing.join('、')}`;
+      this.emit();
       return failure(ErrorLayer.HANDSHAKE_REGISTRATION, 'INITIALIZATION_TIMEOUT',
-        'Device reply and fresh reliable downlink were not both observed');
+        this.lastError);
     } catch (error) {
-      return failure(ErrorLayer.HANDSHAKE_REGISTRATION, 'INITIALIZATION_FAILED', errorMessage(error));
+      if (!current()) return cancelled();
+      this.lastError = errorMessage(error);
+      this.emit();
+      return failure(ErrorLayer.HANDSHAKE_REGISTRATION, 'INITIALIZATION_FAILED', this.lastError);
     }
   }
 
   async disconnect(): Promise<OperationResult<boolean>> {
     this.phaseValue = SessionPhase.CLOSING;
     this.emit();
+    const cleanupGeneration = this.generation + 1;
     await this.cleanup();
-    this.phaseValue = SessionPhase.DISCONNECTED;
-    this.emit();
+    if (this.generation === cleanupGeneration) {
+      this.phaseValue = SessionPhase.DISCONNECTED;
+      this.emit();
+    }
     return success(true);
   }
 
@@ -274,6 +345,8 @@ export class DroneSession {
       sentDatagrams: this.channel.sentCount(),
       lastUdpPeer: this.channel.lastPeer(),
       downlinkAgeMs: this.lastReceivedAt === undefined ? undefined : Math.max(0, now - this.lastReceivedAt),
+      controlDownlinkAgeMs: this.lastControlReceivedAt === undefined ? undefined :
+        Math.max(0, now - this.lastControlReceivedAt),
       videoAgeMs: this.lastVideoAt === undefined ? undefined : Math.max(0, now - this.lastVideoAt),
       lastError: this.lastError,
       transport: this.transport?.snapshot(),
@@ -295,7 +368,26 @@ export class DroneSession {
   isReliableLinkFresh(): boolean {
     const snapshot = this.snapshot();
     return snapshot.phase === SessionPhase.READY && snapshot.deviceVerified &&
-      snapshot.downlinkAgeMs !== undefined && snapshot.downlinkAgeMs <= 1000;
+      snapshot.controlDownlinkAgeMs !== undefined && snapshot.controlDownlinkAgeMs <= 1000;
+  }
+
+  isStartupReady(): boolean {
+    return this.phaseValue === SessionPhase.READY && this.startupMissing().length === 0;
+  }
+
+  private startupMissing(): string[] {
+    const now = Date.now();
+    const telemetry = this.telemetry.snapshot(now);
+    const missing: string[] = [];
+    if (!this.deviceVerified) missing.push('设备身份确认');
+    if (this.lastControlReceivedAt === undefined || now - this.lastControlReceivedAt > 1000) {
+      missing.push('控制链路');
+    }
+    if (this.lastVideoAt === undefined || now - this.lastVideoAt > 1000) missing.push('图传数据');
+    if (telemetry.flight === undefined || (telemetry.flightAgeMs ?? Infinity) > 1000) missing.push('飞行状态');
+    if (telemetry.task === undefined || (telemetry.taskAgeMs ?? Infinity) > 1000) missing.push('任务状态');
+    if (telemetry.camera === undefined || (telemetry.cameraAgeMs ?? Infinity) > 1000) missing.push('相机状态');
+    return missing;
   }
 
   async refreshReliableLink(timeoutMs: number = 1200): Promise<boolean> {
@@ -346,8 +438,8 @@ export class DroneSession {
       inner, commandSet, commandId, receiver, timeoutMs);
   }
 
-  private async queryDevice(timeoutMs: number): Promise<void> {
-    if (this.lastReceivedAt === undefined || Date.now() - this.lastReceivedAt > 1000) {
+  private async queryDevice(timeoutMs: number): Promise<boolean> {
+    if (this.lastControlReceivedAt === undefined || Date.now() - this.lastControlReceivedAt > 1000) {
       throw new Error('Aircraft downlink is not active');
     }
     const inner = this.nextInner();
@@ -357,11 +449,12 @@ export class DroneSession {
       inner, outer, timeoutMs);
     const reply = await this.requestReliable(buildTunnelCommand(3, 0x34, new Uint8Array(0), inner, outer),
       inner, 3, 0x34, 3, timeoutMs);
-    this.deviceVerified = reply !== undefined && reply.length > 0 && reply[0] === 0;
+    const verified = reply !== undefined && reply.length > 0 && reply[0] === 0;
     hilog.info(LOG_DOMAIN, LOG_TAG,
       'device query result received=%{public}s length=%{public}d verified=%{public}s',
       reply !== undefined ? 'true' : 'false', reply === undefined ? 0 : reply.length,
-      this.deviceVerified ? 'true' : 'false');
+      verified ? 'true' : 'false');
+    return verified;
   }
 
   private async probeStartupQueries(timeoutMs: number): Promise<void> {
@@ -397,8 +490,9 @@ export class DroneSession {
       });
     });
     try {
-      await this.sendReliable(frame);
-      return await response;
+      // A response or its timeout is authoritative even if the platform's send
+      // callback is delayed. Promise.race also consumes a later send rejection.
+      return await Promise.race([this.sendReliable(frame).then(() => response), response]);
     } catch (error) {
       const pending = this.pending.get(sequence);
       if (pending !== undefined) {
@@ -433,6 +527,7 @@ export class DroneSession {
 
   private onPacket(raw: Uint8Array, receivedAtMs: number): void {
     if (this.phaseValue === SessionPhase.HANDSHAKING && isMatchingHandshakeReply(raw, this.session)) {
+      if (this.handshakeMatched) return;
       this.handshakeMatched = true;
       // Python prepare_seconds window starts at the handshake match: the tick loop
       // sends the short 01/0a initial frames until this deadline, then full sticks.
@@ -441,6 +536,7 @@ export class DroneSession {
         INITIAL_STICK_PHASE_MS);
       return;
     }
+    if (this.phaseValue === SessionPhase.HANDSHAKING && !this.handshakeMatched) return;
     let outer: OuterPacket;
     try {
       outer = parseOuterPacket(raw);
@@ -501,6 +597,7 @@ export class DroneSession {
     }
     this.receivedPackets++;
     this.lastReceivedAt = receivedAtMs;
+    if (outer.channel === 1 && raw.length >= 34) this.lastControlReceivedAt = receivedAtMs;
     if (outer.channel === 2) {
       this.lastVideoAt = receivedAtMs;
       const frame = this.videoAssembler.feed(raw, receivedAtMs);
@@ -539,25 +636,33 @@ export class DroneSession {
   }
 
   private async tick(): Promise<void> {
-    if (this.ticking || this.transport === undefined || this.registration === undefined) {
+    if (this.ticking || this.transport === undefined || this.registration === undefined ||
+      (this.phaseValue !== SessionPhase.REGISTERING && this.phaseValue !== SessionPhase.READY)) {
       return;
     }
+    const generation = this.generation;
+    const current = (): boolean => generation === this.generation &&
+      (this.phaseValue === SessionPhase.REGISTERING || this.phaseValue === SessionPhase.READY);
     this.ticking = true;
     try {
       const now = Date.now();
       const registrationFrames = this.registration.poll(now, () => this.nextInner(), () => this.nextOuter());
       for (let index = 0; index < registrationFrames.length; index++) {
         await this.sendReliable(registrationFrames[index]);
+        if (!current()) return;
       }
       await this.sendStick(false);
+      if (!current()) return;
       await this.channel.send(this.transport.acknowledgement());
+      if (!current()) return;
       const retries = this.transport.retries(now);
       for (let index = 0; index < retries.length; index++) {
         await this.channel.send(retries[index]);
+        if (!current()) return;
       }
       this.emitThrottled();
     } finally {
-      this.ticking = false;
+      if (generation === this.generation) this.ticking = false;
     }
   }
 
@@ -632,6 +737,11 @@ export class DroneSession {
   }
 
   private async cleanup(): Promise<void> {
+    // Invalidate pending callbacks before awaiting any asynchronous resource close.
+    this.generation++;
+    const generation = this.generation;
+    const routing = this.routing;
+    this.ticking = false;
     this.telemetry.clearSubject();
     if (this.tickTimer !== undefined) {
       clearInterval(this.tickTimer);
@@ -647,13 +757,13 @@ export class DroneSession {
     });
     this.pending.clear();
     await this.channel.close();
-    this.routing?.close();
+    routing?.close();
+    if (generation !== this.generation) return;
     this.routing = undefined;
     this.transport = undefined;
     this.registration = undefined;
     this.selection = undefined;
     this.profileId = '';
-    this.generation++;
   }
 }
 

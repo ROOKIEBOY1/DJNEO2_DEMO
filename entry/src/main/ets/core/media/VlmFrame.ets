@@ -75,3 +75,49 @@ export function closestFrameSubjects(capturedAtMs: number, before?: SubjectSnaps
   }
   return selected;
 }
+
+export interface FrameSubjectReport {
+  source: 'candidates' | 'tracking';
+  observedAtMs: number;
+  candidates: SubjectBox[];
+  currentSubjectId?: number;
+}
+
+export class FrameSubjectChangedError extends Error {
+  constructor() {
+    super('取帧期间已确认的主体跟踪发生变化，请重新确认主体');
+  }
+}
+
+// Scan selection and verification of an already confirmed target use different
+// reports. Tracking coordinates belong to trackingAt, never to detectionAt.
+export function matchFrameSubjects(capturedAtMs: number, reports: SubjectSnapshot[],
+  lockedSubjectId?: number): FrameSubjectReport | undefined {
+  let selected: FrameSubjectReport | undefined;
+  let smallest = 200;
+  for (const report of reports) {
+    const trackingId = trackedSubjectId(report);
+    if (lockedSubjectId !== undefined) {
+      if (trackingId !== lockedSubjectId || report.trackingAt === undefined ||
+        (report.selectedIdCandidate !== undefined && report.selectedIdCandidate <= 255 &&
+          report.selectedIdCandidate !== lockedSubjectId)) continue;
+      const distance = Math.abs(report.trackingAt - capturedAtMs);
+      if (distance <= smallest) {
+        smallest = distance;
+        selected = { source: 'tracking', observedAtMs: report.trackingAt,
+          candidates: report.overlay.slice(), currentSubjectId: lockedSubjectId };
+      }
+    } else if (report.detectionAt !== undefined) {
+      const distance = Math.abs(report.detectionAt - capturedAtMs);
+      if (distance <= smallest) {
+        smallest = distance;
+        const trackMatches = report.trackingAt !== undefined &&
+          Math.abs(report.trackingAt - capturedAtMs) <= 200 &&
+          report.candidates.some((candidate: SubjectBox) => candidate.id === trackingId);
+        selected = { source: 'candidates', observedAtMs: report.detectionAt,
+          candidates: report.candidates.slice(), currentSubjectId: trackMatches ? trackingId : undefined };
+      }
+    }
+  }
+  return selected;
+}

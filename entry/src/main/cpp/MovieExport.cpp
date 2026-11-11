@@ -1,6 +1,8 @@
 #include "MovieExport.h"
 #include "MovieFrames.h"
 #include "MovieAudio.h"
+#include "AvcConfiguration.h"
+#include "MovieRecipe.h"
 #include <hilog/log.h>
 #include <multimedia/player_framework/native_avsource.h>
 #include <multimedia/player_framework/native_avdemuxer.h>
@@ -44,6 +46,18 @@ int64_t Long(OH_AVFormat *f, const char *key, int64_t fallback = 0) {
 }
 std::string String(OH_AVFormat *f, const char *key) {
     const char *value = nullptr; OH_AVFormat_GetStringValue(f, key, &value); return value ? value : "";
+}
+AvcConfiguration DescribeAvcConfiguration(const char *stage, const uint8_t *data, size_t size) {
+    const auto configuration = InspectAvcConfiguration(data, size);
+    static const char hex[] = "0123456789abcdef";
+    std::string prefix;
+    for (size_t i = 0; data && i < std::min<size_t>(size, 48); ++i) {
+        prefix += hex[data[i] >> 4]; prefix += hex[data[i] & 15];
+    }
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0, "NeoMovie",
+        "AVC config stage=%{public}s bytes=%{public}zu SPS=%{public}u PPS=%{public}u complete=%{public}d prefix=%{public}s",
+        stage, size, configuration.sps, configuration.pps, configuration.complete ? 1 : 0, prefix.c_str());
+    return configuration;
 }
 struct Fd {
     int value = -1;
@@ -136,12 +150,10 @@ public:
             Need(muxer_ != nullptr, "Cannot create MP4 muxer");
             Format meta(OH_AVFormat_Create(), OH_AVFormat_Destroy);
             Need(meta != nullptr, "Cannot create MP4 metadata");
-            const char *credit = "Titan by Scott Buckley / CC BY 4.0 / https://www.scottbuckley.com.au/library/titan/; looped and faded";
-            OH_AVFormat_SetStringValue(meta.get(), OH_MD_KEY_TITLE, "Neo movie / Titan");
-            OH_AVFormat_SetStringValue(meta.get(), OH_MD_KEY_ARTIST, "Scott Buckley");
-            OH_AVFormat_SetStringValue(meta.get(), OH_MD_KEY_COPYRIGHT, credit);
-            OH_AVFormat_SetStringValue(meta.get(), OH_MD_KEY_COMMENT, credit);
-            Check(OH_AVMuxer_SetFormat(muxer_.get(), meta.get()), "Cannot write music credit metadata");
+            OH_AVFormat_SetStringValue(meta.get(), OH_MD_KEY_TITLE, "Neo movie");
+            OH_AVFormat_SetStringValue(meta.get(), OH_MD_KEY_COMMENT,
+                "BGM extracted from user-provided video; starts at 0s, looped and faded");
+            Check(OH_AVMuxer_SetFormat(muxer_.get(), meta.get()), "Cannot write movie metadata");
             encoder_.reset(OH_VideoEncoder_CreateByMime("video/avc"));
             Need(encoder_ != nullptr, "H.264 video encoder is unavailable");
             Format format(OH_AVFormat_CreateVideoFormat("video/avc", canvas.width, canvas.height), OH_AVFormat_Destroy);
@@ -238,19 +250,34 @@ private:
         // description. AddTrack requires the MIME even for a known AVC encoder.
         Need(OH_AVFormat_SetStringValue(format.get(), OH_MD_KEY_CODEC_MIME, "video/avc"),
              "Cannot identify the H.264 mux track");
-        if (!config_.empty()) OH_AVFormat_SetBuffer(format.get(), OH_MD_KEY_CODEC_CONFIG, config_.data(), config_.size());
+        if (!config_.empty()) Need(OH_AVFormat_SetBuffer(format.get(), OH_MD_KEY_CODEC_CONFIG, config_.data(), config_.size()),
+            "Cannot set H.264 codec configuration");
         uint8_t *config = nullptr; size_t size = 0;
         Need(OH_AVFormat_GetBuffer(format.get(), OH_MD_KEY_CODEC_CONFIG, &config, &size) && config && size > 0,
              "H.264 encoder did not provide SPS/PPS codec configuration");
+        Need(DescribeAvcConfiguration("encoder", config, size).complete,
+            "H.264 encoder codec configuration is missing SPS or PPS");
         Need(music_.format && !music_.samples.empty(), "Music encoder did not produce AAC samples");
         const char *videoDescription = OH_AVFormat_DumpInfo(format.get());
         const char *audioDescription = OH_AVFormat_DumpInfo(music_.format.get());
         OH_LOG_Print(LOG_APP, LOG_INFO, 0, "NeoMovie", "Mux video %{public}s audio %{public}s",
             videoDescription ? videoDescription : "unavailable", audioDescription ? audioDescription : "unavailable");
         Check(OH_AVMuxer_AddTrack(muxer_.get(), &videoTrack_, format.get()), "Cannot add H.264 track");
-        Check(OH_AVMuxer_AddTrack(muxer_.get(), &audioTrack_, music_.format.get()), "Cannot add Titan AAC track");
+        Check(OH_AVMuxer_AddTrack(muxer_.get(), &audioTrack_, music_.format.get()), "Cannot add BGM AAC track");
         Check(OH_AVMuxer_Start(muxer_.get()), "Cannot start MP4 muxer");
         started_ = true;
+        if (!config_.empty()) {
+            // This muxer does not populate avcC from AddTrack metadata alone.
+            // Deliver the original encoder configuration before the first IDR;
+            // it is codec data, not another picture on the movie timeline.
+            AvBuffer sample(OH_AVBuffer_Create(static_cast<int32_t>(config_.size())), OH_AVBuffer_Destroy);
+            Need(sample && OH_AVBuffer_GetAddr(sample.get()), "Cannot allocate H.264 configuration mux buffer");
+            std::memcpy(OH_AVBuffer_GetAddr(sample.get()), config_.data(), config_.size());
+            OH_AVCodecBufferAttr attr{}; attr.size = static_cast<int32_t>(config_.size());
+            attr.flags = AVCODEC_BUFFER_FLAGS_CODEC_DATA;
+            Check(OH_AVBuffer_SetBufferAttr(sample.get(), &attr), "Cannot set H.264 mux configuration");
+            Check(OH_AVMuxer_WriteSampleBuffer(muxer_.get(), videoTrack_, sample.get()), "Cannot write H.264 mux configuration");
+        }
     }
     void WriteAudio(int64_t until) {
         while (audioCursor_ < music_.samples.size() && music_.samples[audioCursor_].attr.pts <= until) {
@@ -263,7 +290,7 @@ private:
             OH_AVCodecBufferAttr attr = sample.attr; attr.offset = 0; attr.size = static_cast<int32_t>(sample.bytes.size());
             attr.flags &= ~static_cast<uint32_t>(AVCODEC_BUFFER_FLAGS_EOS | AVCODEC_BUFFER_FLAGS_CODEC_DATA);
             Check(OH_AVBuffer_SetBufferAttr(buffer.get(), &attr), "Cannot set AAC mux sample");
-            Check(OH_AVMuxer_WriteSampleBuffer(muxer_.get(), audioTrack_, buffer.get()), "Cannot write Titan AAC sample");
+            Check(OH_AVMuxer_WriteSampleBuffer(muxer_.get(), audioTrack_, buffer.get()), "Cannot write BGM AAC sample");
             ++audioCursor_;
         }
     }
@@ -434,9 +461,10 @@ void ValidateCompleted(const std::string &path, int64_t expectedDurationUs, cons
     Format source(OH_AVSource_GetSourceFormat(input.source.get()), OH_AVFormat_Destroy);
     Need(source != nullptr, "Completed MP4 cannot be reopened");
     const int count = Int(source.get(), OH_MD_KEY_TRACK_COUNT);
-    Need(count == 2, "Completed MP4 must contain both video and Titan audio");
+    Need(count == 2, "Completed MP4 must contain both video and BGM audio");
     bool video = false, audio = false;
     std::vector<int64_t> packetDurations, packetCounts;
+    std::vector<bool> videoConfigurations;
     for (int i = 0; i < count; ++i) {
         Format track(OH_AVSource_GetTrackFormat(input.source.get(), i), OH_AVFormat_Destroy);
         Need(track != nullptr, "Completed MP4 track is unreadable");
@@ -445,6 +473,13 @@ void ValidateCompleted(const std::string &path, int64_t expectedDurationUs, cons
         video = video || (type == MEDIA_TYPE_VID && mime == "video/avc");
         audio = audio || (type == MEDIA_TYPE_AUD && mime == "audio/mp4a-latm");
         const bool videoTrack = type == MEDIA_TYPE_VID && mime == "video/avc";
+        bool configured = !videoTrack;
+        if (videoTrack) {
+            uint8_t *config = nullptr; size_t size = 0;
+            if (OH_AVFormat_GetBuffer(track.get(), OH_MD_KEY_CODEC_CONFIG, &config, &size))
+                configured = DescribeAvcConfiguration("completed", config, size).complete;
+        }
+        videoConfigurations.push_back(configured);
         if (!videoTrack) Need(type == MEDIA_TYPE_AUD && mime == "audio/mp4a-latm" &&
             Int(track.get(), OH_MD_KEY_AUD_SAMPLE_RATE) == 48000, "Completed MP4 music is not 48kHz AAC");
         const int64_t packetDuration = videoTrack ? 33334 : 21334; // 30fps / AAC-LC 1024 samples at 48kHz
@@ -485,6 +520,16 @@ void ValidateCompleted(const std::string &path, int64_t expectedDurationUs, cons
             // they are actual media samples containing parameter sets, not
             // separate encoder configuration events. Count their PTS as well.
             if (attr.size > 0) {
+                if (!videoConfigurations[i]) {
+                    const auto *bytes = OH_AVBuffer_GetAddr(sample.get());
+                    Need(bytes && attr.offset >= 0 && static_cast<int64_t>(attr.offset) + attr.size <=
+                        OH_AVBuffer_GetCapacity(sample.get()), "Completed MP4 video sample bounds are invalid");
+                    const auto configuration = InspectAvcConfiguration(bytes + attr.offset, static_cast<size_t>(attr.size));
+                    Need(configuration.complete, "Completed MP4 video is missing SPS or PPS codec configuration");
+                    videoConfigurations[i] = true;
+                    OH_LOG_Print(LOG_APP, LOG_INFO, 0, "NeoMovie", "AVC first sample SPS=%{public}u PPS=%{public}u",
+                        configuration.sps, configuration.pps);
+                }
                 Need(attr.pts >= 0 && attr.pts > lastPts, "Completed MP4 track timestamps are invalid");
                 if (lastPts < 0) Need(attr.pts <= 1000, "Completed MP4 track starts late");
                 else Need(attr.pts - lastPts <= packetDurations[i] + 1000, "Completed MP4 track has a missing packet");
@@ -513,7 +558,7 @@ void Export(Job &job, const Progress &progress) {
     // The difference from the sum of original durations is less than one encoded frame per source clip.
     durationUs = MovieFrameTime(frames);
     const Size canvas = MovieCanvas(clips[0].width, clips[0].height, clips[0].rotation);
-    Need(canvas.width >= 192 && canvas.height >= 40, "Movie is too small for readable music credit");
+    Need(canvas.width >= 192 && canvas.height >= 40, "Movie canvas is too small");
     for (const auto &clip : clips) {
         Need(clip.primaries == clips[0].primaries && clip.transfer == clips[0].transfer && clip.matrix == clips[0].matrix,
              "Mixed video color spaces require conversion and cannot be exported by this version");
@@ -537,7 +582,8 @@ void Export(Job &job, const Progress &progress) {
                     canvas.width, canvas.height, 0, false, false};
                 // Sample the fade at the exposure midpoint. Sampling t=0 alone would turn a one-frame movie black.
                 const auto exposure = pts + std::min<int64_t>(16666, durationUs - pts);
-                auto output = RenderMovieFrame(packed, canvas, 0, VideoGain(exposure, durationUs), durationUs - pts <= 3000000);
+                auto output = RenderMovieFrame(packed, canvas, 0, VideoGain(exposure, durationUs),
+                    MUSIC_SHOW_CREDIT && durationUs - pts <= 3000000);
                 writer.Frame(output, pts);
                 ++next;
                 progress("rendering", .22 + .72 * static_cast<double>(next) / frames, durationUs / 1000);

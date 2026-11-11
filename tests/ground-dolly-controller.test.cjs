@@ -1,7 +1,7 @@
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const {AppController}=require('../entry/src/main/ets/core/domain/AppController.ets');
-const {GroundDollyWorkflow}=require('../entry/src/main/ets/core/domain/GroundDollyWorkflow.ets');
+const {SubjectTaskWorkflow}=require('../entry/src/main/ets/core/domain/SubjectTaskWorkflow.ets');
 
 function fixture(){
   const c=Object.create(AppController.prototype);const calls=[];let airborne=false;let gen=2;let selected;
@@ -10,7 +10,7 @@ function fixture(){
     tracking:selected!==undefined,overlay:selected===undefined?boxes:[{id:selected}],selectedIdCandidate:selected});
   Object.assign(c,{agentGeneration:0,emit(){},log(){},finishAgentObservation(id){calls.push(['finish',id]);},
     ensureAgentObservation(){},busyValue:false,isOrdinarySubjectHover:()=>true,
-    video:{snapshot:()=>({state:'live'})},groundDolly:new GroundDollyWorkflow(()=>{}),captureMedia:{hasPending:()=>false},
+    video:{snapshot:()=>({state:'live'})},groundDolly:new SubjectTaskWorkflow(()=>{}),captureMedia:{hasPending:()=>false},
     session:{sessionId:()=>10,isReliableLinkFresh:()=>true,snapshot:()=>({phase:'ready',telemetry:{
       flight:{airborne,motorsOn:airborne},flightAgeMs:0,task:{phaseRaw:0,modeRaw:0},subject:subject()}})},
     flight:{snapshot:()=>({generation:gen})}});
@@ -24,7 +24,7 @@ function fixture(){
   c.requestCloudAgentAction=async(obs,text)=>{
     calls.push(['cloud',obs.purpose,obs.flightGeneration,text]);
     return {version:2,requestId:obs.requestId,command:obs.purpose==='ground_dolly_intent'?
-      {action:'dolly_zoom',framing:'半身',zoom:3,retreat:false}:{action:'dolly_zoom',subjectId:13,zoom:2}};
+      {action:'dolly_zoom',framing:'半身',zoom:3,retreat:false}:{action:'select_subject',subjectId:13}};
   };
   c.performVoiceFlightAction=async()=>{calls.push(['takeoff']);airborne=true;gen++;return {message:'起飞'};};
   c.performAgentAction=async(obs,command)=>{
@@ -38,7 +38,7 @@ test('controller uses ground intent and airborne VLM selection, then confirms a 
   const {c,calls}=fixture();
   const result=await c.runCloudVoiceRequest('帮我给白衣男生拍三倍半身滑动变焦');
   assert.equal(result.confirmationRequired,true);
-  assert.deepEqual(calls.filter(x=>x[0]==='cloud').map(x=>[x[1],x[2]]),[['ground_dolly_intent',2],['dolly_subject',3]]);
+  assert.deepEqual(calls.filter(x=>x[0]==='cloud').map(x=>[x[1],x[2]]),[['ground_dolly_intent',2],['subject_selection',3]]);
   const before=calls.filter(x=>x[0]==='execute');assert.equal(before.length,1);
   assert.equal(before[0][1].action,'select_subject');
   await c.confirmGroundDolly();
@@ -82,7 +82,7 @@ test('ground photo and unclear visual selection retain normal action handling or
   await normal.c.runCloudVoiceRequest('拍张照片');assert.equal(accepted,1);
   assert.equal(normal.calls.some(x=>x[0]==='takeoff'),false);
   const missing=fixture();const cloud=missing.c.requestCloudAgentAction;
-  missing.c.requestCloudAgentAction=async(obs,text)=>obs.purpose==='dolly_subject'?
+  missing.c.requestCloudAgentAction=async(obs,text)=>obs.purpose==='subject_selection'?
     {version:2,requestId:obs.requestId,command:{action:'none',message:'未找到白衣男生'}}:cloud(obs,text);
   await assert.rejects(missing.c.runCloudVoiceRequest('白衣男生滑动变焦'),/未找到/);
   assert.equal(missing.calls.some(x=>x[0]==='execute'),false);

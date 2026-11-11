@@ -1,10 +1,11 @@
 import { VlmFrame, VLM_SELECTION_TIMEOUT_MS } from '../media/VlmFrame';
 import { MovementDirection } from '../protocol/StickCodec';
 import { DollyFraming } from '../protocol/NativeTaskCodec';
+import { MovementStep, validateMovementSteps } from './MovementSequence';
 
 export type AgentActionKind = 'select_subject' | 'cancel_subject' | 'set_dolly' | 'prepare_dolly' | 'dolly_zoom' |
   'circle' | 'follow' | 'photo' | 'record_start' | 'record_stop' | 'download_photo' | 'download_video' |
-  'move' | 'stop' | 'takeoff' | 'land' | 'none';
+  'move' | 'move_sequence' | 'stop' | 'takeoff' | 'land' | 'none';
 
 export type DirectFlightAction = 'takeoff' | 'land';
 
@@ -25,6 +26,7 @@ export function parseDirectStopVoice(text: string): 'stop' | 'record_stop' | und
 export interface AgentAction {
   action: AgentActionKind;
   subjectId?: number;
+  subjectRequired?: boolean;
   framing?: DollyFraming;
   zoom?: number;
   retreat?: boolean;
@@ -32,6 +34,7 @@ export interface AgentAction {
   radiusMeters?: number;
   direction?: MovementDirection;
   seconds?: number;
+  steps?: MovementStep[];
   message?: string;
 }
 
@@ -55,7 +58,7 @@ export interface AgentContext {
 }
 
 export interface AgentObservation {
-  purpose?: 'shoot_intent' | 'ground_dolly_intent' | 'dolly_subject';
+  purpose?: 'shoot_intent' | 'ground_dolly_intent' | 'dolly_subject' | 'subject_selection';
   requestId: string;
   sessionId: number;
   flightGeneration: number;
@@ -86,26 +89,45 @@ export interface AgentOutcome {
 }
 
 export function agentNeedsConfirmation(command: AgentAction): boolean {
-  return ['dolly_zoom', 'circle', 'follow', 'move'].includes(command.action);
+  return ['dolly_zoom', 'circle', 'follow'].includes(command.action);
+}
+
+export function actionNeedsSubjectSelection(command: AgentAction): boolean {
+  return ['dolly_zoom', 'follow', 'circle', 'select_subject'].includes(command.action) ||
+    (['photo', 'record_start'].includes(command.action) &&
+      (command.subjectId !== undefined || command.subjectRequired === true));
 }
 
 export function validateAgentAction(command: AgentAction, observation: AgentObservation): void {
   if (command === null || typeof command !== 'object' || Array.isArray(command)) throw new Error('动作格式无效');
+  if (observation.purpose === 'subject_selection' && command.action !== 'select_subject' && command.action !== 'none') {
+    throw new Error('选人阶段只能返回明确的主体选择或说明');
+  }
   let fields: string[] = [];
   switch (command.action) {
-    case 'select_subject': case 'photo': case 'follow': fields = ['subjectId']; break;
+    case 'select_subject': case 'photo': case 'record_start': fields = ['subjectId', 'subjectRequired']; break;
+    case 'follow': fields = ['subjectId']; break;
     case 'set_dolly': fields = ['framing', 'zoom', 'retreat']; break;
     case 'dolly_zoom': fields = ['subjectId', 'framing', 'zoom', 'retreat', 'recipe']; break;
     case 'prepare_dolly': fields = ['framing', 'zoom', 'retreat']; break;
     case 'circle': fields = ['radiusMeters', 'subjectId']; break;
     case 'move': fields = ['direction', 'seconds']; break;
+    case 'move_sequence': fields = ['steps']; break;
     case 'none': fields = ['message']; break;
-    case 'cancel_subject': case 'record_start': case 'record_stop':
+    case 'cancel_subject': case 'record_stop':
     case 'download_photo': case 'download_video': case 'stop': case 'takeoff': case 'land': break;
     default: throw new Error('不支持的动作');
   }
   if (Object.keys(command).some(key => key !== 'action' && !fields.includes(key))) throw new Error('动作包含无效参数');
-  if (command.action === 'select_subject' && command.subjectId === undefined) throw new Error('选人缺少编号');
+  if (command.action === 'move_sequence') validateMovementSteps(command.steps);
+  if (command.subjectRequired !== undefined && typeof command.subjectRequired !== 'boolean') throw new Error('主体选择参数无效');
+  if (observation.purpose === 'subject_selection' && command.subjectRequired !== undefined) {
+    throw new Error('选人阶段不能修改已确认的动作或参数');
+  }
+  const initialIntent = observation.purpose === 'ground_dolly_intent' || observation.purpose === 'shoot_intent';
+  const deferredSubject = initialIntent && command.subjectRequired === true;
+  if (command.subjectId === undefined && !deferredSubject &&
+    (command.action === 'select_subject' || command.subjectRequired === true)) throw new Error('选人缺少编号');
   if (command.subjectId !== undefined && (!Number.isInteger(command.subjectId) || command.subjectId < 0 ||
     command.subjectId > 255 || observation.frame === undefined ||
     !observation.frame.candidates.some(candidate => candidate.id === command.subjectId))) {
@@ -121,6 +143,9 @@ export function validateAgentAction(command: AgentAction, observation: AgentObse
   }
   if (command.action === 'move' && !['forward', 'backward', 'left', 'right', 'up', 'down',
     'turn_left', 'turn_right'].includes(command.direction ?? '')) throw new Error('移动方向无效');
+  if (command.action === 'move' && command.seconds === undefined) {
+    throw new Error('模型未给出有效移动时长，请重新说明移动幅度或秒数');
+  }
   if (command.seconds !== undefined && (typeof command.seconds !== 'number' || !Number.isFinite(command.seconds) ||
     command.seconds < 0.1 || command.seconds > 10)) throw new Error('单次移动时长需要在 0.1–10 秒内');
   if (command.message !== undefined && (typeof command.message !== 'string' || command.message.length > 160)) {
@@ -145,7 +170,7 @@ export function validateAgentResponse(response: AgentResponse, observation: Agen
 
 export function agentActionLabel(command: AgentAction): string {
   switch (command.action) {
-    case 'select_subject': return `选择主体 #${command.subjectId}`;
+    case 'select_subject': return command.subjectId === undefined ? '选择主体' : `选择主体 #${command.subjectId}`;
     case 'cancel_subject': return '取消主体锁定';
     case 'set_dolly': return '设置滑动变焦参数';
     case 'prepare_dolly': return '地面准备滑动变焦';
@@ -163,6 +188,7 @@ export function agentActionLabel(command: AgentAction): string {
       const directions: MovementDirection[] = ['forward', 'backward', 'left', 'right', 'up', 'down', 'turn_left', 'turn_right'];
       return `${['前进', '后退', '左移', '右移', '上升', '下降', '左转', '右转'][directions.indexOf(command.direction as MovementDirection)]} ${command.seconds} 秒`;
     }
+    case 'move_sequence': return '执行连续基础运动';
     case 'stop': return '停止任务并回中';
     case 'takeoff': return '起飞';
     case 'land': return '降落';

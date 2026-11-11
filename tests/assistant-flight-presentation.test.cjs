@@ -1,6 +1,6 @@
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
-const {flightPlanPresentation,taskProgressPresentation,videoResultReady,videoResultPresentation,flightResultMetrics}=
+const {flightPlanPresentation,taskProgressPresentation,videoResultReady,videoResultPresentation,flightResultMetrics,subjectConfirmationLabel}=
   require('../entry/src/main/ets/core/domain/AssistantFlightPresentation.ets');
 
 function state(overrides={}) {
@@ -105,6 +105,16 @@ test('task progress reports observed execution and fresh recording while marking
   assert.match(lines,/目标倍率：3倍/);assert.doesNotMatch(lines,/当前焦段|低风险|高度/);
 });
 
+test('an unowned shooting stage does not resurrect an old task after reconnect',()=>{
+  const old=state({groundDolly:{stage:'shooting',active:false},
+    session:{telemetry:{cameraAgeMs:0,camera:{recordingCandidate:false}}}});
+  assert.equal(taskProgressPresentation(old).visible,false);
+  const sealing={...old,groundDolly:{stage:'shooting',active:false,plan:{action:'dolly_zoom',zoom:3}}};
+  assert.equal(taskProgressPresentation(sealing).visible,true,'the current plan still owns its post-shooting seal window');
+  assert.equal(taskProgressPresentation({...old,videoCapturePending:true,
+    nativeTask:{kind:'dolly',activeOrUnknown:true}}).visible,true);
+});
+
 test('progress does not present stale camera states or an unverified candidate altitude as facts',()=>{
   const result=taskProgressPresentation(state({groundDolly:{stage:'shooting',active:false},
     nativeTask:{kind:'dolly',activeOrUnknown:true,executionObserved:false},
@@ -189,4 +199,66 @@ test('completed local video survives later stale telemetry while new capture and
     const local={...result,...patch};assert.equal(videoResultReady(local),true);
     assert.equal(taskProgressPresentation(local).visible,false);
   }
+});
+
+test('generic follow and circle progress use their selected action without dolly zoom parameters',()=>{
+  for(const [action,want] of [['follow',/跟随/],['circle',/环绕/]]){
+    for(const stage of ['starting','shooting']){
+      const result=taskProgressPresentation(state({groundDolly:{stage:'plan',active:true,plan:{zoom:3}},
+        subjectTask:{stage,active:stage==='starting',plan:{action,subjectId:7,radiusMeters:5}},
+        nativeTask:{kind:action,activeOrUnknown:stage==='shooting',executionObserved:stage==='shooting'}}));
+      assert.equal(result.visible,true);assert.match(result.lines.join('\n'),want);
+      assert.doesNotMatch(result.lines.join('\n'),/目标倍率|滑动变焦|希区柯克/);
+      if(action==='circle')assert.match(result.lines.join('\n'),/5米/);
+    }
+  }
+});
+
+test('photo and select-subject never borrow a stale native task or camera state for flight progress',()=>{
+  for(const action of ['photo','select_subject'])for(const stage of ['confirm','starting','completed']){
+    const result=taskProgressPresentation(state({subjectTask:{stage,active:stage!=='completed',plan:{action,subjectId:7}},
+      nativeTask:{kind:'dolly',activeOrUnknown:true,executionObserved:true},
+      session:{telemetry:{cameraAgeMs:0,camera:{recordingCandidate:true}}}}));
+    assert.equal(result.visible,false,`${action} ${stage}`);assert.deepEqual(result.lines,[]);
+  }
+});
+
+test('generic preparation blocks old media while completed subject selection retains playable originals',()=>{
+  const retained=state({agentMediaKind:'video',agentMediaUri:'one',agentMediaUris:['one'],agentVideoResultReady:true});
+  for(const stage of ['scanning','selecting','confirm','starting']){
+    const preparing={...retained,subjectTask:{stage,active:true,plan:{action:'select_subject',subjectId:7}}};
+    assert.equal(videoResultReady(preparing),false,stage);
+    assert.equal(taskProgressPresentation(preparing).visible,false,stage);
+  }
+  const completed={...retained,groundDolly:{stage:'confirm',active:true},
+    subjectTask:{stage:'completed',active:false,plan:{action:'select_subject',subjectId:7}}};
+  assert.equal(videoResultReady(completed),true);
+  assert.equal(taskProgressPresentation(completed).visible,false);
+  assert.deepEqual(completed.agentMediaUris,['one']);
+});
+
+test('generic dolly plan preserves the confirmed recipe and ignores stale legacy plan parameters',()=>{
+  const result=flightPlanPresentation(state({groundDolly:{stage:'plan',active:true,plan:{zoom:2,framing:'远景'}},
+    subjectTask:{stage:'plan',active:true,plan:{action:'dolly_zoom',recipe:'dolly_circle',subjectId:7,zoom:3,framing:'半身'}}}));
+  assert.match(result.title,/特写/);assert.match(result.lines.join('\n'),/3倍/);
+  assert.match(result.lines.join('\n'),/半身/);assert.doesNotMatch(result.lines.join('\n'),/远景|2倍/);
+});
+
+test('subject recording uses a recording confirmation and never presents movement progress or fake flight metrics',()=>{
+  for(const stage of ['confirm','starting','shooting']){
+    const recording=state({subjectTask:{stage,active:stage!=='shooting',plan:{action:'record_start',subjectId:7}},
+      recordingRequested:true,nativeTask:{kind:'dolly',activeOrUnknown:true,executionObserved:true},
+      session:{telemetry:{cameraAgeMs:0,camera:{recordingCandidate:true}}}});
+    assert.equal(subjectConfirmationLabel(recording),'确认录像主体');
+    const progress=taskProgressPresentation(recording);
+    assert.equal(progress.visible,false,stage);assert.deepEqual(progress.lines,[]);
+  }
+  assert.equal(subjectConfirmationLabel(state({subjectTask:{stage:'confirm',active:true,plan:{action:'select_subject',subjectId:7}}})),
+    '确认主体');
+  const result=state({subjectTask:{stage:'shooting',active:false,plan:{action:'record_start',subjectId:7}},
+    agentMediaKind:'video',agentMediaUri:'one',agentMediaUris:['one','two'],agentVideoResultReady:true});
+  assert.equal(videoResultReady(result),true);
+  assert.match(videoResultPresentation(result).title,/录像结果/);
+  assert.doesNotMatch(videoResultPresentation(result).title,/飞行/);
+  assert.deepEqual(flightResultMetrics(result),[]);
 });

@@ -1,6 +1,8 @@
 #include "MovieAudio.h"
 #include "AudioPcm.h"
 #include "AudioAac.h"
+#include "AudioSourceDuration.h"
+#include "MovieRecipe.h"
 #include <hilog/log.h>
 #include <multimedia/player_framework/native_avcodec_audiocodec.h>
 #include <multimedia/player_framework/native_avdemuxer.h>
@@ -43,7 +45,7 @@ bool IsCancelled(void *context)
 struct File {
     explicit File(const std::string &path) : fd(open(path.c_str(), O_RDONLY | O_CLOEXEC))
     {
-        if (fd < 0) Fail("cannot open the bundled Titan track");
+        if (fd < 0) Fail("cannot open the bundled BGM track");
     }
     ~File() { close(fd); }
     int fd;
@@ -102,7 +104,7 @@ struct Layout {
         sampleFormat = IntValue(description.get(), OH_MD_KEY_AUDIO_SAMPLE_FORMAT);
         const char *details = OH_AVFormat_DumpInfo(description.get());
         OH_LOG_Print(LOG_APP, LOG_INFO, 0, "NeoMovie",
-            "Titan decoder layout rate=%{public}d channels=%{public}d sampleFormat=%{public}d description=%{public}s",
+            "BGM decoder layout rate=%{public}d channels=%{public}d sampleFormat=%{public}d description=%{public}s",
             rate, channels, sampleFormat, details ? details : "(unavailable)");
         if (rate < 8000 || rate > 192000 || (channels != 1 && channels != 2)) Fail("unsupported decoded rate or channel layout");
     }
@@ -134,7 +136,7 @@ struct Pcm {
         const size_t frameBytes = width * layout.channels;
         if (static_cast<size_t>(attr.size) % frameBytes) Fail("unaligned decoded PCM buffer");
         const size_t frames = static_cast<size_t>(attr.size) / frameBytes;
-        if (frames > MAX_PCM_BYTES / 4 || stereo.size() > MAX_PCM_BYTES / 2 - frames * 2) Fail("Titan decoded audio exceeds memory limit");
+        if (frames > MAX_PCM_BYTES / 4 || stereo.size() > MAX_PCM_BYTES / 2 - frames * 2) Fail("BGM decoded audio exceeds memory limit");
         const size_t begin = stereo.size();
         stereo.resize(begin + frames * 2);
         const pcm::View view{OH_AVBuffer_GetAddr(buffer) + attr.offset, static_cast<size_t>(attr.size),
@@ -151,17 +153,17 @@ Pcm Decode(const std::string &path, const std::atomic_bool &cancelled,
 {
     File file(path);
     struct stat info{};
-    if (fstat(file.fd, &info) != 0 || info.st_size <= 0 || info.st_size > 32 * 1024 * 1024) Fail("invalid Titan resource size");
+    if (fstat(file.fd, &info) != 0 || info.st_size <= 0 || info.st_size > 32 * 1024 * 1024) Fail("invalid BGM resource size");
     Source source(OH_AVSource_CreateWithFD(file.fd, 0, info.st_size), OH_AVSource_Destroy);
-    if (!source) Fail("cannot parse the Titan MP3");
+    if (!source) Fail("cannot parse the BGM MP3");
     Format sourceFormat(OH_AVSource_GetSourceFormat(source.get()), OH_AVFormat_Destroy);
     const int trackCount = IntValue(sourceFormat.get(), OH_MD_KEY_TRACK_COUNT);
     if (trackCount <= 0 || trackCount > 16) Fail("invalid music track count");
     int64_t duration = 0;
-    if (!OH_AVFormat_GetLongValue(sourceFormat.get(), OH_MD_KEY_DURATION, &duration) || duration <= 0) Fail("missing Titan duration");
+    if (!OH_AVFormat_GetLongValue(sourceFormat.get(), OH_MD_KEY_DURATION, &duration) || duration <= 0) Fail("missing BGM duration");
     const char *sourceDetails = OH_AVFormat_DumpInfo(sourceFormat.get());
     OH_LOG_Print(LOG_APP, LOG_INFO, 0, "NeoMovie",
-        "Titan source bytes=%{public}lld tracks=%{public}d durationUs=%{public}lld description=%{public}s",
+        "BGM source bytes=%{public}lld tracks=%{public}d durationUs=%{public}lld description=%{public}s",
         static_cast<long long>(info.st_size), trackCount, static_cast<long long>(duration),
         sourceDetails ? sourceDetails : "(unavailable)");
     Format track(nullptr, OH_AVFormat_Destroy);
@@ -176,13 +178,13 @@ Pcm Decode(const std::string &path, const std::atomic_bool &cancelled,
             break;
         }
     }
-    if (!track) Fail("Titan resource contains no MP3 audio track");
+    if (!track) Fail("BGM resource contains no MP3 audio track");
     const char *trackDetails = OH_AVFormat_DumpInfo(track.get());
-    OH_LOG_Print(LOG_APP, LOG_INFO, 0, "NeoMovie", "Titan selected track=%{public}u description=%{public}s",
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0, "NeoMovie", "BGM selected track=%{public}u description=%{public}s",
         trackIndex, trackDetails ? trackDetails : "(unavailable)");
     Demuxer demuxer(OH_AVDemuxer_CreateWithSource(source.get()), OH_AVDemuxer_Destroy);
-    if (!demuxer) Fail("cannot create Titan demuxer");
-    Check(OH_AVDemuxer_SelectTrackByID(demuxer.get(), trackIndex), "select Titan track");
+    if (!demuxer) Fail("cannot create BGM demuxer");
+    Check(OH_AVDemuxer_SelectTrackByID(demuxer.get(), trackIndex), "select BGM track");
     Codec decoder("audio/mpeg", false);
     if (!OH_AVFormat_SetIntValue(track.get(), OH_MD_KEY_AUDIO_SAMPLE_FORMAT, SAMPLE_S16LE)) Fail("cannot request MP3 PCM output");
     decoder.Start(track.get());
@@ -200,13 +202,13 @@ Pcm Decode(const std::string &path, const std::atomic_bool &cancelled,
             const auto code = OH_AudioCodec_QueryOutputBuffer(decoder.value, &index, 0);
             if (code == AV_ERR_TRY_AGAIN_LATER) break;
             if (code == AV_ERR_STREAM_CHANGED) { layout.Read(decoder.value); activity = true; continue; }
-            Check(code, "query decoded Titan output");
+            Check(code, "query decoded BGM output");
             OutputLease lease{decoder.value, index};
             auto *buffer = OH_AudioCodec_GetOutputBuffer(decoder.value, index);
             const auto attr = Attr(buffer);
             if (outputSamples < 8 || (attr.flags & AVCODEC_BUFFER_FLAGS_EOS) || outputSamples % 1024 == 0) {
                 OH_LOG_Print(LOG_APP, LOG_INFO, 0, "NeoMovie",
-                    "Titan decoder output packet=%{public}llu index=%{public}u pts=%{public}lld size=%{public}d offset=%{public}d capacity=%{public}d flags=%{public}u pcmBefore=%{public}zu inputs=%{public}llu inputEnded=%{public}d",
+                    "BGM decoder output packet=%{public}llu index=%{public}u pts=%{public}lld size=%{public}d offset=%{public}d capacity=%{public}d flags=%{public}u pcmBefore=%{public}zu inputs=%{public}llu inputEnded=%{public}d",
                     static_cast<unsigned long long>(outputSamples), index, static_cast<long long>(attr.pts),
                     attr.size, attr.offset, OH_AVBuffer_GetCapacity(buffer), attr.flags, pcm.stereo.size() / 2,
                     static_cast<unsigned long long>(inputSamples), inputEnded ? 1 : 0);
@@ -229,10 +231,10 @@ Pcm Decode(const std::string &path, const std::atomic_bool &cancelled,
             uint32_t index = 0;
             const auto code = OH_AudioCodec_QueryInputBuffer(decoder.value, &index, 10000);
             if (code != AV_ERR_TRY_AGAIN_LATER) {
-                Check(code, "query Titan decoder input");
+                Check(code, "query BGM decoder input");
                 auto *buffer = OH_AudioCodec_GetInputBuffer(decoder.value, index);
-                if (!buffer) Fail("missing Titan decoder input buffer");
-                Check(OH_AVDemuxer_ReadSampleBuffer(demuxer.get(), trackIndex, buffer), "read Titan MP3 sample");
+                if (!buffer) Fail("missing BGM decoder input buffer");
+                Check(OH_AVDemuxer_ReadSampleBuffer(demuxer.get(), trackIndex, buffer), "read BGM MP3 sample");
                 const auto attr = Attr(buffer);
                 if (inputSamples < 8 || (attr.flags & AVCODEC_BUFFER_FLAGS_EOS) || inputSamples % 1024 == 0) {
                     char header[17]{};
@@ -245,7 +247,7 @@ Pcm Decode(const std::string &path, const std::atomic_bool &cancelled,
                         }
                     }
                     OH_LOG_Print(LOG_APP, LOG_INFO, 0, "NeoMovie",
-                        "Titan decoder input sample=%{public}llu index=%{public}u pts=%{public}lld size=%{public}d offset=%{public}d capacity=%{public}d flags=%{public}u header=%{public}s",
+                        "BGM decoder input sample=%{public}llu index=%{public}u pts=%{public}lld size=%{public}d offset=%{public}d capacity=%{public}d flags=%{public}u header=%{public}s",
                         static_cast<unsigned long long>(inputSamples), index, static_cast<long long>(attr.pts),
                         attr.size, attr.offset, OH_AVBuffer_GetCapacity(buffer), attr.flags, header);
                 }
@@ -253,30 +255,42 @@ Pcm Decode(const std::string &path, const std::atomic_bool &cancelled,
                 inputBytes += static_cast<uint64_t>(attr.size);
                 lastInputPts = attr.pts;
                 inputEnded = attr.flags & AVCODEC_BUFFER_FLAGS_EOS;
-                Check(OH_AudioCodec_PushInputBuffer(decoder.value, index), "submit Titan MP3 sample");
+                Check(OH_AudioCodec_PushInputBuffer(decoder.value, index), "submit BGM MP3 sample");
                 activity = true;
             }
         }
         if (activity) lastActivity = Clock::now();
-        else if (Clock::now() - lastActivity > std::chrono::seconds(30)) Fail("Titan decoder timed out");
+        else if (Clock::now() - lastActivity > std::chrono::seconds(30)) Fail("BGM decoder timed out");
         if (inputEnded && !outputEnded && !activity) usleep(1000);
     }
     OH_LOG_Print(LOG_APP, LOG_INFO, 0, "NeoMovie",
-        "Titan decoder drained inputs=%{public}llu inputBytes=%{public}llu inputEnded=%{public}d lastInputPts=%{public}lld outputs=%{public}llu outputBytes=%{public}llu outputEnded=%{public}d lastOutputPts=%{public}lld expectedDuration=%{public}lld",
+        "BGM decoder drained inputs=%{public}llu inputBytes=%{public}llu inputEnded=%{public}d lastInputPts=%{public}lld outputs=%{public}llu outputBytes=%{public}llu outputEnded=%{public}d lastOutputPts=%{public}lld expectedDuration=%{public}lld",
         static_cast<unsigned long long>(inputSamples), static_cast<unsigned long long>(inputBytes), inputEnded ? 1 : 0,
         static_cast<long long>(lastInputPts), static_cast<unsigned long long>(outputSamples),
         static_cast<unsigned long long>(outputBytes), outputEnded ? 1 : 0, static_cast<long long>(lastOutputPts),
         static_cast<long long>(duration));
-    if (pcm.stereo.empty() || !pcm.rate) Fail("Titan decoder produced no PCM audio");
-    const int64_t decodedDuration = static_cast<int64_t>((pcm.stereo.size() / 2) * 1000000ULL / pcm.rate);
-    // An MPEG-1 Layer III frame contains 1152 samples. Permit only one frame
-    // of decoder priming/padding or metadata rounding around the source end;
-    // a truncated nonempty prefix must not become looping replacement music.
-    const int64_t frameTolerance = (1152LL * 1000000 + pcm.rate - 1) / pcm.rate;
-    if (decodedDuration < duration - frameTolerance || decodedDuration - frameTolerance > duration) {
-        Fail("Titan decoder did not cover the complete source duration (decoded=" +
-            std::to_string(decodedDuration) + ", expected=" + std::to_string(duration) + ")");
+    if (pcm.stereo.empty() || !pcm.rate) Fail("BGM decoder produced no PCM audio");
+    const auto sourceDuration = audio::PlanSourceDuration(pcm.stereo.size() / 2, pcm.rate, duration,
+        inputEnded, outputEnded);
+    const int64_t rawDuration = static_cast<int64_t>(sourceDuration.rawFrames * 1000000ULL / pcm.rate);
+    const int64_t retainedDuration = static_cast<int64_t>(sourceDuration.retainedFrames * 1000000ULL / pcm.rate);
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0, "NeoMovie",
+        "BGM source coverage reason=%{public}s inputEnded=%{public}d outputEnded=%{public}d rate=%{public}d rawFrames=%{public}llu expectedFrames=%{public}llu retainedFrames=%{public}llu trimmedFrames=%{public}llu rawUs=%{public}lld expectedUs=%{public}lld retainedUs=%{public}lld tailLimitUs=%{public}lld",
+        audio::SourceDurationReason(sourceDuration.status), inputEnded ? 1 : 0, outputEnded ? 1 : 0, pcm.rate,
+        static_cast<unsigned long long>(sourceDuration.rawFrames),
+        static_cast<unsigned long long>(sourceDuration.expectedFrames),
+        static_cast<unsigned long long>(sourceDuration.retainedFrames),
+        static_cast<unsigned long long>(sourceDuration.trimmedFrames),
+        static_cast<long long>(rawDuration), static_cast<long long>(duration),
+        static_cast<long long>(retainedDuration), static_cast<long long>(audio::MAX_SOURCE_TAIL_US));
+    if (!sourceDuration.Accepted()) {
+        Fail(std::string(audio::SourceDurationReason(sourceDuration.status)) + " (decoded=" +
+            std::to_string(rawDuration) + ", expected=" + std::to_string(duration) + ")");
     }
+    // Keep a genuine shortfall bounded to one MP3 frame. A complete decode may
+    // have a small excess, but it is never included in the rendered loop.
+    if (!audio::ApplySourceDurationPlan(pcm.stereo, sourceDuration)) Fail("invalid normalized BGM PCM size");
+    const int64_t frameTolerance = (1152LL * 1000000 + pcm.rate - 1) / pcm.rate;
     int peak = 0;
     uint64_t absolute = 0;
     for (const int sample : pcm.stereo) {
@@ -285,9 +299,9 @@ Pcm Decode(const std::string &path, const std::atomic_bool &cancelled,
         absolute += amplitude;
     }
     OH_LOG_Print(LOG_APP, LOG_INFO, 0, "NeoMovie",
-        "Titan decoded rate=%{public}d frames=%{public}zu peak=%{public}d meanAbs=%{public}llu durationUs=%{public}lld expectedUs=%{public}lld toleranceUs=%{public}lld",
+        "BGM decoded rate=%{public}d frames=%{public}zu peak=%{public}d meanAbs=%{public}llu durationUs=%{public}lld expectedUs=%{public}lld toleranceUs=%{public}lld",
         pcm.rate, pcm.stereo.size() / 2, peak, static_cast<unsigned long long>(absolute / pcm.stereo.size()),
-        static_cast<long long>(decodedDuration), static_cast<long long>(duration), static_cast<long long>(frameTolerance));
+        static_cast<long long>(retainedDuration), static_cast<long long>(duration), static_cast<long long>(frameTolerance));
     if (progress) progress(0.2);
     return pcm;
 }
@@ -295,6 +309,8 @@ Pcm Decode(const std::string &path, const std::atomic_bool &cancelled,
 MusicTrack Encode(const Pcm &pcm, int64_t durationUs, const std::atomic_bool &cancelled,
     const std::function<void(double)> &progress)
 {
+    const uint64_t sourceStartFrames = static_cast<uint64_t>(pcm.rate) * MUSIC_START_SECONDS;
+    if (sourceStartFrames >= pcm.stereo.size() / 2) Fail("BGM excerpt begins outside the decoded music");
     Codec encoder("audio/mp4a-latm", true);
     Format config(OH_AVFormat_CreateAudioFormat("audio/mp4a-latm", 48000, 2), OH_AVFormat_Destroy);
     if (!config || !OH_AVFormat_SetLongValue(config.get(), OH_MD_KEY_BITRATE, 192000) ||
@@ -410,9 +426,10 @@ MusicTrack Encode(const Pcm &pcm, int64_t durationUs, const std::atomic_bool &ca
                     const size_t frames = static_cast<size_t>(std::min<uint64_t>(1024, totalFrames - submitted));
                     int16_t samples[2048]{};
                     if (!pcm::Render(pcm.stereo.data(), pcm.stereo.size() / 2, pcm.rate, submitted,
-                        totalFrames, frames, samples, IsCancelled, const_cast<std::atomic_bool *>(&cancelled))) {
+                        totalFrames, frames, samples, IsCancelled, const_cast<std::atomic_bool *>(&cancelled),
+                        sourceStartFrames)) {
                         CheckCancel(cancelled);
-                        Fail("cannot resample or loop Titan PCM");
+                        Fail("cannot resample or loop BGM PCM");
                     }
                     // AAC-LC consumes 1024 samples; retain the exact media end
                     // in totalFrames and pad only this final codec frame.
@@ -462,7 +479,7 @@ MusicTrack BuildMusicTrack(const std::string &musicPath, int64_t durationUs,
 {
     CheckCancel(cancelled);
     if (durationUs <= 0 || durationUs > MAX_DURATION_US) Fail("invalid movie music duration (maximum two hours)");
-    if (musicPath.empty()) Fail("missing bundled Titan resource path");
+    if (musicPath.empty()) Fail("missing bundled BGM resource path");
     if (progress) progress(0.0);
     const auto pcm = Decode(musicPath, cancelled, progress);
     return Encode(pcm, durationUs, cancelled, progress);

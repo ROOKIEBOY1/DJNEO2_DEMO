@@ -83,7 +83,7 @@ test('shoot intent may reuse only a current image candidate and keeps other acti
 });
 
 test('desktop and phone phase prompts agree with and without an initial ready image',async()=>{
-  for(const purpose of ['shoot_intent','ground_dolly_intent','dolly_subject']) {
+  for(const purpose of ['shoot_intent','ground_dolly_intent','dolly_subject','subject_selection']) {
     for(const hasImage of [false,true]) {
       const obs={...observation(),purpose,...(!hasImage?{frame:undefined}:{})};
       const text='给白衣男生拍特写镜头';

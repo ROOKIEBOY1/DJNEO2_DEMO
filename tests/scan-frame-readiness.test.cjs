@@ -1,7 +1,7 @@
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const {AppController}=require('../entry/src/main/ets/core/domain/AppController.ets');
-const {GroundDollyWorkflow}=require('../entry/src/main/ets/core/domain/GroundDollyWorkflow.ets');
+const {SubjectTaskWorkflow}=require('../entry/src/main/ets/core/domain/SubjectTaskWorkflow.ets');
 const {CloseupSequence}=require('../entry/src/main/ets/core/domain/CloseupSequence.ets');
 const {CloseupMediaGroup}=require('../entry/src/main/ets/core/media/CloseupMediaGroup.ets');
 const {FlightCommandService}=require('../entry/src/main/ets/core/domain/FlightCommandService.ets');
@@ -58,7 +58,7 @@ function fixture({temporaryCandidate=true,deliverCandidates=true,landAfterScanRe
     autoScanGeneration:-1,autoScanRequestedGeneration:-1,autoScanGateLog:'',autoScanHoverSince:undefined,
     autoScanFailures:0,autoScanRetryAt:0,autoScanRunning:false,hoverScanAttempted:false,demoStage:'closed',
     nativeConfig:{radiusMeters:2,framing:'全身',zoom:2,retreat:false},defaultMovementSeconds:.5,
-    groundDolly:new GroundDollyWorkflow(()=>{}),closeupSequence:new CloseupSequence(()=>{}),
+    groundDolly:new SubjectTaskWorkflow(()=>{}),closeupSequence:new CloseupSequence(()=>{}),
     closeupMedia:new CloseupMediaGroup(),captureMedia:{hasPending:()=>false},
     camera:{snapshot:()=>({recordingRequested:false,operationActive:false})},
     nativeTasks:{snapshot:()=>({kind:'none',prepared:false,busy:false,activeOrUnknown:false}),
@@ -75,7 +75,7 @@ function fixture({temporaryCandidate=true,deliverCandidates=true,landAfterScanRe
   c.requestCloudAgentAction=async observation=>{
     record('cloud',{purpose:observation.purpose,frame:observation.frame});
     const command=observation.purpose==='ground_dolly_intent'?{action:'dolly_zoom',recipe:'dolly_circle'}:
-      {action:'dolly_zoom',subjectId:13};
+      {action:'select_subject',subjectId:13};
     return {version:2,requestId:observation.requestId,command};
   };
   function advance(now){
@@ -117,10 +117,10 @@ test('a ground closeup waits through automatic scan reset and its empty ready re
     assert.equal(f.c.groundDolly.snapshot().stage,'confirm');
     assert.equal(f.c.groundDolly.snapshot().subjectId,13);
     assert.deepEqual(f.events.filter(event=>event.kind==='cloud').map(event=>event.purpose),
-      ['ground_dolly_intent','dolly_subject']);
+      ['ground_dolly_intent','subject_selection']);
     const ready=f.events.find(event=>event.kind==='scan-ready');
     const arrived=f.events.find(event=>event.kind==='fresh-candidates');
-    const visual=f.events.find(event=>event.kind==='cloud'&&event.purpose==='dolly_subject');
+    const visual=f.events.find(event=>event.kind==='cloud'&&event.purpose==='subject_selection');
     assert.deepEqual(ready.ids,[],'scan-ready is deliberately received before the new candidates');
     assert.ok(arrived.at>ready.at);
     assert.ok(visual.at>=arrived.at,'visual selection must wait until the reset generation has a fresh nonempty frame');

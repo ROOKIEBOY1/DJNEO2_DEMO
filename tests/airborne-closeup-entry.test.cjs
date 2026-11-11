@@ -1,7 +1,7 @@
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const {AppController}=require('../entry/src/main/ets/core/domain/AppController.ets');
-const {GroundDollyWorkflow}=require('../entry/src/main/ets/core/domain/GroundDollyWorkflow.ets');
+const {SubjectTaskWorkflow}=require('../entry/src/main/ets/core/domain/SubjectTaskWorkflow.ets');
 const {CloseupSequence}=require('../entry/src/main/ets/core/domain/CloseupSequence.ets');
 const {CloseupMediaGroup}=require('../entry/src/main/ets/core/media/CloseupMediaGroup.ets');
 const {CancellationToken}=require('../entry/src/main/ets/core/domain/OperationResult.ets');
@@ -26,7 +26,7 @@ function fixture(options={}){
     subject:subject()}});
   Object.assign(c,{agentGeneration:0,autoScanRequestedGeneration:generation,latestAgentRequestId:'',acceptedAgentRequestId:'',agentFeedback:'',
     emit(){},log(message){events.push(['log',message]);},busyValue:flags.busy,activeOperations:0,lastErrorValue:'',lastErrorLayerValue:'',
-    groundDolly:new GroundDollyWorkflow(()=>{}),closeupSequence:new CloseupSequence(()=>{}),closeupMedia:new CloseupMediaGroup(),
+    groundDolly:new SubjectTaskWorkflow(()=>{}),closeupSequence:new CloseupSequence(()=>{}),closeupMedia:new CloseupMediaGroup(),
     video:{snapshot:()=>({state:'live'})},captureMedia:{hasPending:()=>flags.pendingVideo},
     camera:{snapshot:()=>({operationActive:false,recordingRequested:flags.recording})},
     nativeConfig:{radiusMeters:2,framing:'全身',zoom:2,retreat:false},
@@ -51,7 +51,7 @@ function fixture(options={}){
   };
   c.requestCloudAgentAction=async observation=>{
     events.push(['cloud',observation.purpose,observation.frame?.currentSubjectId]);
-    const command=observation.purpose==='dolly_subject'?{action:'dolly_zoom',subjectId:13}:
+    const command=observation.purpose==='subject_selection'?{action:'select_subject',subjectId:13}:
       {action:'dolly_zoom',recipe:'dolly_circle',subjectId:13};
     return {version:2,requestId:observation.requestId,command};
   };
@@ -118,7 +118,7 @@ test('reusing confirmed same-ID tracking synchronizes the local selection used b
 
 test('mode 6 with no initial candidates waits for automatic scanning before visual selection',async()=>{
   const {c,events,flags}=fixture({candidateIds:[]});const cloud=c.requestCloudAgentAction;
-  c.requestCloudAgentAction=async observation=>observation.purpose==='dolly_subject'?cloud(observation):
+  c.requestCloudAgentAction=async observation=>observation.purpose==='subject_selection'?cloud(observation):
     {version:2,requestId:observation.requestId,command:{action:'dolly_zoom',recipe:'dolly_circle'}};
   c.pollAutoSubjectScan=async()=>{events.push(['scan']);flags.candidateIds=[11,13];};
   await c.runCloudVoiceRequest('帮黑衣男生拍特写');
@@ -235,11 +235,11 @@ test('a tracked subject is not blindly reused when the visual response selects t
 
 test('an airborne intent without an ID performs visual selection before asking for subject confirmation',async()=>{
   const {c,events}=fixture();const cloud=c.requestCloudAgentAction;
-  c.requestCloudAgentAction=async observation=>observation.purpose==='dolly_subject'?cloud(observation):
+  c.requestCloudAgentAction=async observation=>observation.purpose==='subject_selection'?cloud(observation):
     {version:2,requestId:observation.requestId,command:{action:'dolly_zoom',recipe:'dolly_circle'}};
   await c.runCloudVoiceRequest('帮我拍一段特写');
   assert.equal(c.groundDolly.snapshot().stage,'confirm');assert.equal(c.groundDolly.snapshot().subjectId,13);
-  assert.equal(events.some(event=>event[0]==='cloud'&&event[1]==='dolly_subject'),true);
+  assert.equal(events.some(event=>event[0]==='cloud'&&event[1]==='subject_selection'),true);
   assert.equal(events.some(event=>event[0]==='takeoff'),false);
 });
 

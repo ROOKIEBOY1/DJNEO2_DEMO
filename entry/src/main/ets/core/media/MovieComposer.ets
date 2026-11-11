@@ -1,3 +1,5 @@
+export const MOVIE_TEMPLATE_VERSION: string = 'user-bgm-v5';
+
 export type MovieCompositionStage = 'idle' | 'probing' | 'rendering' | 'finalizing' |
   'completed' | 'failed' | 'cancelled';
 
@@ -79,7 +81,7 @@ export class MovieComposer {
       return;
     }
     if (music.length === 0) {
-      this.failCurrent('Titan配乐尚未准备好，请重试');
+      this.failCurrent('配乐尚未准备好，请重试');
       return;
     }
     if (this.aliasesSource(output) || this.samePath(output, music)) {
@@ -264,7 +266,7 @@ export class MovieComposer {
   }
 
   private keyFor(sources: string[], revision: string): string {
-    return 'titan-v1|' + JSON.stringify([revision, ...sources]);
+    return MOVIE_TEMPLATE_VERSION + '|' + JSON.stringify([revision, ...sources]);
   }
 
   private aliasesSource(outputPath: string): boolean {

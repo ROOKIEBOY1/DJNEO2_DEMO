@@ -1,4 +1,5 @@
 import { ConsoleSnapshot } from './AppController';
+import { SubjectTaskSnapshot } from './SubjectTaskWorkflow';
 
 export interface FlightPlanPresentation {
   title: string;
@@ -15,8 +16,16 @@ export interface TaskProgressPresentation {
 export interface VideoResultPresentation { title: string; detail: string; }
 export interface ResultMetric { label: string; value: string; mocked: boolean; }
 
+export function subjectTaskSnapshot(state: ConsoleSnapshot): SubjectTaskSnapshot {
+  return state.subjectTask ?? state.groundDolly;
+}
+
+export function subjectConfirmationLabel(state: ConsoleSnapshot): string {
+  return subjectTaskSnapshot(state).plan?.action === 'record_start' ? '确认录像主体' : '确认主体';
+}
+
 export function flightPlanPresentation(state: ConsoleSnapshot): FlightPlanPresentation {
-  const plan = state.groundDolly.plan;
+  const plan = subjectTaskSnapshot(state).plan;
   if (plan?.recipe === 'dolly_circle') return {
     title: '方案：特写组合镜头',
     detail: '小艺将为你确认的同一个主体先拍滑动变焦，再进行2米环绕；全部拍摄结束后统一取回录像。',
@@ -50,30 +59,36 @@ export function flightPlanPresentation(state: ConsoleSnapshot): FlightPlanPresen
 }
 
 export function taskProgressPresentation(state: ConsoleSnapshot): TaskProgressPresentation {
-  const stage = state.groundDolly.stage;
+  const task = subjectTaskSnapshot(state);
+  const stage = task.stage;
+  const action = task.plan?.action;
   const compound = state.closeup?.active === true;
-  if (videoTransferActive(state)) {
+  if (videoTransferActive(state) || !compound && (action === 'photo' || action === 'select_subject' || action === 'record_start')) {
     return { visible: false, title: '飞行任务进度', lines: [] };
   }
   const stepKind = state.closeup?.step === 2 ? 'circle' : 'dolly';
   const preparing = ['taking_off', 'scanning', 'selecting', 'confirm', 'plan'].includes(stage);
-  const recording = compound && state.nativeTask.kind !== stepKind ? undefined : freshRecording(state);
-  const visible = compound || !preparing && !videoResultReady(state) && (stage === 'starting' || stage === 'shooting' ||
+  const independent = action === 'follow' || action === 'circle';
+  const kindMatches = !independent || state.nativeTask.kind === action;
+  const recording = compound && state.nativeTask.kind !== stepKind || !kindMatches ? undefined : freshRecording(state);
+  const ownsShooting = stage === 'shooting' && task.plan !== undefined;
+  const visible = compound || !preparing && !videoResultReady(state) && (stage === 'starting' || ownsShooting ||
     state.nativeTask.activeOrUnknown || state.videoCapturePending || recording === true);
-  const zoom = state.groundDolly.plan?.zoom ?? state.nativeTask.config?.zoom;
+  const zoom = task.plan?.zoom ?? state.nativeTask.config?.zoom;
   let phase = '等待任务状态';
   if (compound) phase = closeupPhase(state, stepKind, recording);
-  else if (stage === 'starting') phase = '准备录像与运镜';
-  else if (state.nativeTask.activeOrUnknown) phase = state.nativeTask.executionObserved ?
+  else if (stage === 'starting') phase = independent ? `准备${taskName(action)}` : '准备录像与运镜';
+  else if (state.nativeTask.activeOrUnknown && kindMatches) phase = state.nativeTask.executionObserved ?
     `正在执行${taskName(state.nativeTask.kind)}` : '等待运镜执行回报';
   else if (recording === true) phase = '正在录制画面';
   else if (stage === 'shooting') phase = '正在整理拍摄素材';
-  const lines = [
-    `飞行阶段：${phase}`,
-    `目标倍率：${zoomLabel(zoom)}`,
+  const lines = [`飞行阶段：${phase}`];
+  if (!independent) lines.push(`目标倍率：${zoomLabel(zoom)}`);
+  if (action === 'circle' && task.plan?.radiusMeters !== undefined) lines.push(`环绕半径：${task.plan.radiusMeters}米`);
+  lines.push(
     `录制状态：${recording === true ? '正在录制' : recording === false ? '已停止录制' : '等待相机状态回报'}`,
     '任务结束：悬停'
-  ];
+  );
   if (compound) lines.unshift(`组合步骤：${state.closeup.step}/2 · ${stepKind === 'circle' ? '同主体2米环绕' : '滑动变焦'}`);
   return { visible: visible, title: '飞行任务进度', lines: lines };
 }
@@ -84,7 +99,8 @@ export function videoTransferActive(state: ConsoleSnapshot): boolean {
   if (!state.videoCapturePending) return false;
   // Retrieval reports are newer evidence than generic workflow/native-task flags.
   if (hasMediaTransferFeedback(state)) return true;
-  if (['taking_off', 'scanning', 'selecting', 'confirm', 'plan', 'starting'].includes(state.groundDolly.stage)) return false;
+  if (subjectTaskSnapshot(state).plan?.action === 'record_start' && state.recordingRequested) return false;
+  if (['taking_off', 'scanning', 'selecting', 'confirm', 'plan', 'starting'].includes(subjectTaskSnapshot(state).stage)) return false;
   return freshRecording(state) !== true && !state.nativeTask.activeOrUnknown;
 }
 
@@ -93,12 +109,13 @@ export function hasMediaTransferFeedback(state: ConsoleSnapshot): boolean {
 }
 
 export function videoResultReady(state: ConsoleSnapshot): boolean {
-  const stage = state.groundDolly.stage;
+  const task = subjectTaskSnapshot(state);
+  const stage = task.stage;
   const blocked = ['taking_off', 'scanning', 'selecting', 'confirm', 'plan', 'starting'].includes(stage);
   // A completed local group remains playable when aircraft telemetry later expires or disconnects.
   // The controller retires this fact before starting another capture or ground workflow.
   const partial = partialCloseup(state);
-  return state.agentVideoResultReady && state.closeup?.active !== true && !blocked && !state.groundDolly.active &&
+  return state.agentVideoResultReady && state.closeup?.active !== true && !blocked && !task.active &&
     (!state.videoCapturePending || partial) &&
     (state.agentConfirmation ?? '').length === 0 &&
     state.agentMediaKind === 'video' && state.agentMediaUri.length > 0 &&
@@ -110,12 +127,16 @@ export function videoResultPresentation(state: ConsoleSnapshot): VideoResultPres
     title: '部分拍摄素材',
     detail: `特写组合${state.closeup.stage === 'cancelled' ? '已取消' : '未完成'}，已保留${state.agentMediaUris.length}段录像，可播放或保存至相册。`
   };
+  if (subjectTaskSnapshot(state).plan?.action === 'record_start') return {
+    title: '录像结果', detail: '本次主体录像已取回，可在对话中播放或保存至相册。'
+  };
   return { title: '飞行任务结果', detail: state.closeup?.stage === 'completed' ?
     '小艺已取回本次特写组合的全部录像，可在对话中播放或保存至相册。' :
     '本次原片已取回，可在对话中播放或保存至相册。' };
 }
 
 export function flightResultMetrics(state: ConsoleSnapshot): ResultMetric[] {
+  if (subjectTaskSnapshot(state).plan?.action === 'record_start') return [];
   // Current telemetry exposes flight flags but no battery, flight clock or odometry.
   // Keep demo values explicit; recording duration is not a flight duration source.
   return [

@@ -110,7 +110,8 @@ test('voice observation waits for this flight scan request instead of accepting 
 test('simple connection initializes only after a successful connection and never starts flight', async () => {
   const { c, events } = controller();
   let phase = 'disconnected';
-  c.session = { snapshot: () => ({ phase }) };
+  c.session = { snapshot: () => ({ phase }), isStartupReady: () => phase === 'ready' };
+  c.video = { snapshot: () => ({ state: 'live', stats: { running: true, waitingForKey: false, lastRenderedAgeMs: 0 } }) };
   c.connectSelectedAircraft = async () => { events.push('connect'); phase = 'registering'; };
   c.initialize = async () => { events.push('initialize'); phase = 'ready'; };
   await c.ensureReadyConnection();
@@ -288,6 +289,14 @@ test('takeoff timeout is not reported as a successful command',async()=>{
   const service=new FlightCommandService({isActionLinkFresh:()=>true,requestFlight:async()=>undefined});
   assert.equal((await service.takeoff(true)).ok,false);
   assert.equal(service.snapshot().takeoffSent,true);
+});
+test('stale action link explains that no takeoff was sent and keeps retry eligible',async()=>{
+  let sent=0;const service=new FlightCommandService({isActionLinkFresh:()=>false,
+    requestFlight:async()=>{sent++;return Uint8Array.of(0);}});
+  const result=await service.takeoff(true);
+  assert.equal(result.ok,false);assert.equal(result.error.code,'LINK_NOT_FRESH');
+  assert.match(result.error.message,/图传.*起飞指令未发送/);
+  assert.equal(sent,0);assert.equal(service.snapshot().takeoffSent,false);
 });
 test('landing NACK is not reported as landed/successful',async()=>{
   const service=new FlightCommandService({centerSticks:async()=>{},requestFlight:async()=>new Uint8Array([2])});

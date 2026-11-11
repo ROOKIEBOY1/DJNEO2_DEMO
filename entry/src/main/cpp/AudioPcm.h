@@ -95,14 +95,20 @@ inline double Envelope(uint64_t frame, uint64_t totalFrames)
 
 inline bool Render(const int16_t *source, size_t sourceFrames, int sourceRate,
     uint64_t start, uint64_t totalFrames, size_t frames, int16_t *output,
-    bool (*cancelled)(void *), void *context)
+    bool (*cancelled)(void *), void *context, uint64_t sourceStartFrames = 0)
 {
-    if (!source || !sourceFrames || !output || sourceRate < 8000 || sourceRate > 192000 ||
+    if (!source || !sourceFrames || sourceFrames > 120000000 || sourceFrames > SIZE_MAX / 2 ||
+        sourceStartFrames >= sourceFrames || !output || sourceRate < 8000 || sourceRate > 192000 ||
         start > totalFrames || frames > totalFrames - start || frames > SIZE_MAX / 2) return false;
+    // The offset is in decoded source frames, before resampling. Restrict both
+    // interpolation neighbors and every loop to the selected source tail.
+    const size_t sourceStart = static_cast<size_t>(sourceStartFrames);
+    const auto *excerpt = source + sourceStart * 2;
+    const size_t excerptFrames = sourceFrames - sourceStart;
     for (size_t frame = 0; frame < frames; ++frame) {
         if ((frame % 64 == 0) && cancelled && cancelled(context)) return false;
         int16_t stereo[2];
-        if (!ResampleLoop(source, sourceFrames, sourceRate, start + frame, stereo)) return false;
+        if (!ResampleLoop(excerpt, excerptFrames, sourceRate, start + frame, stereo)) return false;
         const double gain = Envelope(start + frame, totalFrames);
         output[frame * 2] = Saturate(stereo[0] * gain);
         output[frame * 2 + 1] = Saturate(stereo[1] * gain);

@@ -1,7 +1,7 @@
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const {AppController}=require('../entry/src/main/ets/core/domain/AppController.ets');
-const {GroundDollyWorkflow}=require('../entry/src/main/ets/core/domain/GroundDollyWorkflow.ets');
+const {SubjectTaskWorkflow}=require('../entry/src/main/ets/core/domain/SubjectTaskWorkflow.ets');
 const {CloseupSequence}=require('../entry/src/main/ets/core/domain/CloseupSequence.ets');
 const {FlightCommandService}=require('../entry/src/main/ets/core/domain/FlightCommandService.ets');
 const {CancellationToken}=require('../entry/src/main/ets/core/domain/OperationResult.ets');
@@ -48,7 +48,7 @@ function fixture({missedOriginal=false}={}){
     agentVideoResultReady:false,agentFeedback:'',emit(){},log(message){events.push(['log',message]);},
     // These media-recovery tests substitute scan/frame boundaries; scan readiness has its own real-path replay.
     waitForAutomaticSubjectScan:async()=>{},
-    groundDolly:new GroundDollyWorkflow(()=>{}),closeupSequence:new CloseupSequence(()=>{}),
+    groundDolly:new SubjectTaskWorkflow(()=>{}),closeupSequence:new CloseupSequence(()=>{}),
     closeupMedia:new CloseupMediaGroup(),captureMedia:capture,session,flight:new FlightCommandService(session),
     video:{snapshot:()=>({state:'live'})},
     camera:{resetAfterGroundedCycle(){},snapshot:()=>({operationActive:false,recordingRequested:false})},
@@ -76,7 +76,7 @@ function fixture({missedOriginal=false}={}){
   c.requestCloudAgentAction=async observation=>{
     events.push(['cloud',observation.purpose]);
     const command=observation.purpose==='ground_dolly_intent'?{action:'dolly_zoom',recipe}:
-      {action:'dolly_zoom',subjectId:13};
+      {action:'select_subject',subjectId:13};
     return {version:2,requestId:observation.requestId,command};
   };
   // Only subject-selection and native transport are simulated. Capture baselines,

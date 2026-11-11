@@ -211,7 +211,11 @@ export class AircraftProfileStore {
     }
     document.profiles.forEach((record: AircraftProfileRecord) => {
       this.directory(record.id);
-      if (record.displayName.length === 0 || record.ssid.length === 0) throw new Error('Invalid aircraft profile');
+      // First launch persists this placeholder before the user configures aircraft Wi-Fi.
+      const unconfigured = record.registrationKind === 'built_in' && record.ssid === '' && record.password === '';
+      if (record.displayName.length === 0 || (record.ssid.length === 0 && !unconfigured)) {
+        throw new Error('Invalid aircraft profile');
+      }
       ensureDirectory(this.directory(record.id));
     });
     if (document.profiles.find((record: AircraftProfileRecord) => record.id === document.selectedId) === undefined) {

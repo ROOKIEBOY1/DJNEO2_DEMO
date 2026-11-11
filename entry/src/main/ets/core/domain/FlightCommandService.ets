@@ -78,7 +78,7 @@ export class FlightCommandService {
     }
     if (!this.session.isActionLinkFresh()) {
       return failure(ErrorLayer.HANDSHAKE_REGISTRATION, 'LINK_NOT_FRESH',
-        'Verified device reply, downlink and video must all be fresh');
+        '飞机连接或实时图传尚未就绪，本次起飞指令未发送，请等待实时画面恢复后重试');
     }
     if (this.nativeTaskMayFlyValue || this.takeoffSentValue || this.landRequestedValue || this.landSentValue) {
       return failure(ErrorLayer.FLIGHT, 'FLIGHT_CYCLE_LOCKED',
@@ -98,7 +98,7 @@ export class FlightCommandService {
   }
 
   async move(direction: MovementDirection, seconds: number = 0.5,
-    token?: CancellationToken): Promise<OperationResult<boolean>> {
+    token?: CancellationToken, canContinue?: () => boolean): Promise<OperationResult<boolean>> {
     try {
       validateMovementDuration(seconds);
     } catch (error) {
@@ -120,6 +120,9 @@ export class FlightCommandService {
     if (this.tokenCancelled(token)) {
       return failure(ErrorLayer.TASK, 'OPERATION_CANCELLED', 'Operation was cancelled before send');
     }
+    if (canContinue !== undefined && !canContinue()) {
+      return failure(ErrorLayer.FLIGHT, 'MOVEMENT_CONTEXT_CHANGED', '连续基础运动的飞行状态已变化，后续步骤未执行');
+    }
     this.movementActiveValue = true;
     const serviceToken = this.activeToken;
     this.session.setMovementAxes(axesForMovement(direction));
@@ -135,7 +138,13 @@ export class FlightCommandService {
           return failure(ErrorLayer.NETWORK, 'MOVEMENT_LINK_LOST',
             'Aircraft downlink stopped during movement');
         }
+        if (canContinue !== undefined && !canContinue()) {
+          return failure(ErrorLayer.FLIGHT, 'MOVEMENT_CONTEXT_CHANGED', '连续基础运动的飞行状态已变化，后续步骤未执行');
+        }
         await delay(Math.min(50, Math.max(1, deadline - Date.now())));
+      }
+      if (canContinue !== undefined && !canContinue()) {
+        return failure(ErrorLayer.FLIGHT, 'MOVEMENT_CONTEXT_CHANGED', '连续基础运动的飞行状态已变化，后续步骤未执行');
       }
       return success(true);
     } finally {

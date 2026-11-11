@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { subjectFramePresentation, showSubjectFrame } =
+const { subjectFramePresentation, showSubjectFrame, selectedSubjectFrames } =
   require('../entry/src/main/ets/core/domain/SubjectFramePresentation.ets');
 
 function assertBox(actual, expected) {
@@ -61,14 +61,26 @@ test('fully off-screen subjects do not reappear as clamped phantom frames', () =
   }
 });
 
-test('subject frame is visible only during selection before user confirmation', () => {
-  for (const stage of ['selecting', 'confirm']) {
-    assert.equal(showSubjectFrame(stage, false), true, stage);
-    assert.equal(showSubjectFrame(stage, true), false, `${stage} after user confirmation`);
-  }
-  for (const stage of ['', 'idle', 'taking_off', 'scanning', 'plan', 'starting', 'shooting', 'returning',
+test('the workflow confirmation stage owns frame visibility across consecutive requests', () => {
+  assert.equal(showSubjectFrame('confirm'), true);
+  for (const stage of ['', 'idle', 'taking_off', 'scanning', 'selecting', 'plan', 'starting', 'shooting', 'returning',
     'completed', 'failed', 'cancelled']) {
-    assert.equal(showSubjectFrame(stage, false), false, stage);
-    assert.equal(showSubjectFrame(stage, true), false, stage);
+    assert.equal(showSubjectFrame(stage), false, stage);
   }
+  assert.equal(showSubjectFrame('confirm'), true, 'a new confirmation is visible after a completed request');
+});
+
+test('the frame uses only the workflow-selected real target and disappears as confirmation advances', () => {
+  const target = { id: 7, left: 0.3, top: 0.25, width: 0.2, height: 0.4 };
+  const other = { ...target, id: 9, left: 0.6 };
+  const task = { stage: 'confirm', subjectId: 7, active: true };
+  const frames = selectedSubjectFrames(task, [other, target]);
+  assert.equal(frames.length, 1);
+  assertBox(frames[0], { id: 7, left: 0.31, top: 0.27, width: 0.18, height: 0.36 });
+  for (const stage of ['selecting', 'plan', 'starting', 'shooting', 'completed', 'failed', 'cancelled']) {
+    assert.deepEqual(selectedSubjectFrames({ ...task, stage }, [target]), [], stage);
+  }
+  assert.deepEqual(selectedSubjectFrames(task, [other]), [], 'never draw another candidate as the selected subject');
+  assert.deepEqual(selectedSubjectFrames({ ...task, subjectId: undefined }, [target]), []);
+  assert.deepEqual(selectedSubjectFrames(task, [{ ...target, width: 0 }]), []);
 });

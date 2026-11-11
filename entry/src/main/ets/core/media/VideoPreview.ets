@@ -20,6 +20,8 @@ export interface VideoPreviewStats {
   decoderEpoch?: number;
   consecutiveFailures?: number;
   recoveryPaused?: boolean;
+  configurationRetained?: boolean;
+  waitingForKeyAgeMs?: number;
   lastResetReason?: string;
   parameterMask?: number;
   randomAccessFrames?: number;
@@ -51,7 +53,8 @@ function emptyStats(): VideoPreviewStats {
     suppressedParameters: 0, reorderedFrames: 0, width: 0, height: 0,
     lastAssembledAgeMs: -1, lastDecodedAgeMs: -1, lastRenderedAgeMs: -1, lastError: '',
     decoderEpoch: 0, consecutiveFailures: 0, recoveryPaused: false, lastResetReason: '', parameterMask: 0,
-    randomAccessFrames: 0, acceptedRandomAccessFrames: 0, lastSubmittedAgeMs: -1 };
+    randomAccessFrames: 0, acceptedRandomAccessFrames: 0, lastSubmittedAgeMs: -1,
+    configurationRetained: false, waitingForKeyAgeMs: -1 };
 }
 
 // No decoding work runs here. A native worker owns all codec and queue state.

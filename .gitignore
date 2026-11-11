@@ -16,3 +16,5 @@
 *.p12
 *.p7b
 *.csr
+# User-supplied Demo portrait is packaged locally and never committed.
+/entry/src/main/resources/rawfile/demo-self-reference.jpg

@@ -1,5 +1,7 @@
 #include "../../entry/src/main/cpp/AudioPcm.h"
 #include "../../entry/src/main/cpp/AudioAac.h"
+#include "../../entry/src/main/cpp/AudioSourceDuration.h"
+#include "../../entry/src/main/cpp/MovieRecipe.h"
 using namespace neo::movie::pcm;
 #if defined(_WIN32)
 extern "C" { int _fltused = 0; }
@@ -8,10 +10,21 @@ extern "C" { int _fltused = 0; }
 static bool Cancelled(void *value) { return *static_cast<bool *>(value); }
 static bool CancelDuringBlock(void *value) { return ++*static_cast<int *>(value) == 2; }
 
+struct TestStereoPcm {
+    size_t count;
+    unsigned resizes = 0;
+    size_t size() const { return count; }
+    void resize(size_t value) { count = value; ++resizes; }
+};
+
+static int RunSourceDurationTests();
+
 // Hand-checked fixtures catch offset/stride errors, lost channels, wrong rate,
 // repeated one-second fades, missing final fade, and ignored cancellation.
 extern "C" int RunMovieAudioTests()
 {
+    // A user-supplied replacement starts at its beginning and carries no Titan credit.
+    if (neo::movie::MUSIC_START_SECONDS != 0 || neo::movie::MUSIC_SHOW_CREDIT) return 54;
     int16_t stereo[2]{};
     const uint8_t padded[] = {0xe8, 0x03, 0x18, 0xfc, 0xff, 0xff, 0xd0, 0x07, 0x30, 0xf8};
     View packed{padded, sizeof(padded), 2, 2, SampleKind::S16, 6, 2};
@@ -148,6 +161,159 @@ extern "C" int RunMovieAudioTests()
     attrPts = 11135826;
     if (aliased.Push(attrPts, attrPts) != Disposition::Padding || attrPts != 11135826 ||
         !aliased.Complete()) return 41;
+    // The distinct negative intro must never be sampled, even when the tail
+    // loops. Output time is already beyond fade-in; it is not a music offset.
+    const int16_t excerpt[] = {-30000, 30000, -20000, 20000,
+        1200, -1200, 2400, -2400, 3600, -3600};
+    int16_t excerptOutput[10]{};
+    if (!Render(excerpt, 5, 48000, 48000, 240000, 4, excerptOutput, nullptr, nullptr, 2) ||
+        excerptOutput[0] != 1200 || excerptOutput[1] != -1200 ||
+        excerptOutput[2] != 2400 || excerptOutput[3] != -2400 ||
+        excerptOutput[4] != 3600 || excerptOutput[5] != -3600 ||
+        excerptOutput[6] != 1200 || excerptOutput[7] != -1200) return 42;
+    // 44100 -> 48000: source positions in the two-frame tail are
+    // 0, 0.91875, 1.8375; the last value interpolates back to the tail start.
+    const int16_t fractional[] = {-30000, 30000, -20000, 20000,
+        0, 1000, 16000, 17000};
+    if (!Render(fractional, 4, 44100, 48000, 240000, 3, excerptOutput, nullptr, nullptr, 2) ||
+        excerptOutput[0] != 0 || excerptOutput[1] != 1000 ||
+        excerptOutput[2] != 14700 || excerptOutput[3] != 15700 ||
+        excerptOutput[4] != 2600 || excerptOutput[5] != 3600) return 43;
+    // Half-rate seam interpolation is 5000 -> 1000, never 5000 -> intro.
+    const int16_t seam[] = {-30000, 30000, 1000, 1100, 3000, 3100, 5000, 5100};
+    if (!Render(seam, 4, 24000, 48003, 240000, 4, excerptOutput, nullptr, nullptr, 1) ||
+        excerptOutput[0] != 4000 || excerptOutput[1] != 4100 ||
+        excerptOutput[2] != 5000 || excerptOutput[3] != 5100 ||
+        excerptOutput[4] != 3000 || excerptOutput[5] != 3100 ||
+        excerptOutput[6] != 1000 || excerptOutput[7] != 1100) return 44;
+    // Both fades follow the movie clock although the source begins later.
+    const int16_t fadeExcerpt[] = {-30000, 30000, -20000, 20000, 10000, -10000};
+    if (!Render(fadeExcerpt, 3, 48000, 0, 5, 5, excerptOutput, nullptr, nullptr, 2) ||
+        excerptOutput[0] != 0 || excerptOutput[1] != 0 ||
+        excerptOutput[2] != 5000 || excerptOutput[3] != -5000 ||
+        excerptOutput[4] != 10000 || excerptOutput[5] != -10000 ||
+        excerptOutput[6] != 5000 || excerptOutput[7] != -5000 ||
+        excerptOutput[8] != 0 || excerptOutput[9] != 0) return 45;
+    if (!Render(fadeExcerpt, 3, 48000, 24000, 240000, 1, excerptOutput, nullptr, nullptr, 2) ||
+        excerptOutput[0] != 5000 || excerptOutput[1] != -5000 ||
+        !Render(fadeExcerpt, 3, 48000, 215999, 240000, 1, excerptOutput, nullptr, nullptr, 2) ||
+        excerptOutput[0] != 5000 || excerptOutput[1] != -5000 ||
+        !Render(fadeExcerpt, 3, 48000, 239999, 240000, 1, excerptOutput, nullptr, nullptr, 2) ||
+        excerptOutput[0] != 0 || excerptOutput[1] != 0) return 46;
+    // Independent blocks must keep the same fractional source phase. Splits
+    // are deliberately neither AAC boundaries nor integer source positions.
+    int16_t wholeExcerpt[514], splitExcerpt[514];
+    if (!Render(fractional, 4, 44100, 48000, 240000, 257, wholeExcerpt, nullptr, nullptr, 2) ||
+        !Render(fractional, 4, 44100, 48000, 240000, 73, splitExcerpt, nullptr, nullptr, 2) ||
+        !Render(fractional, 4, 44100, 48073, 240000, 111, splitExcerpt + 146, nullptr, nullptr, 2) ||
+        !Render(fractional, 4, 44100, 48184, 240000, 73, splitExcerpt + 368, nullptr, nullptr, 2)) return 47;
+    for (size_t sample = 0; sample < 514; ++sample) {
+        if (wholeExcerpt[sample] != splitExcerpt[sample]) return 48;
+    }
+    // Reject offsets before pointer arithmetic, including empty output and a
+    // huge declared source whose shortened tail would otherwise seem valid.
+    excerptOutput[0] = 1234;
+    if (Render(excerpt, 5, 48000, 48000, 240000, 1, excerptOutput, nullptr, nullptr, 5) ||
+        Render(excerpt, 5, 48000, 48000, 240000, 1, excerptOutput, nullptr, nullptr, 6) ||
+        Render(excerpt, 5, 48000, 48000, 240000, 1, excerptOutput, nullptr, nullptr, UINT64_MAX) ||
+        Render(excerpt, 5, 48000, 48000, 240000, 0, excerptOutput, nullptr, nullptr, 5) ||
+        excerptOutput[0] != 1234) return 49;
+    if (Render(tone, 120000001, 48000, 48000, 240000, 0, excerptOutput, nullptr, nullptr, 120000000) ||
+        Render(tone, SIZE_MAX, 48000, 48000, 240000, 0, excerptOutput, nullptr, nullptr, SIZE_MAX - 1) ||
+        Render(nullptr, 5, 48000, 48000, 240000, 1, excerptOutput, nullptr, nullptr, 2) ||
+        Render(excerpt, 5, 192001, 48000, 240000, 1, excerptOutput, nullptr, nullptr, 2) ||
+        Render(excerpt, 5, 48000, 48000, 240000, 1, nullptr, nullptr, nullptr, 2) ||
+        excerptOutput[0] != 1234) return 50;
+    cancelled = true;
+    if (Render(fadeExcerpt, 3, 48000, 0, 240000, 1, excerptOutput, Cancelled, &cancelled, 2) ||
+        excerptOutput[0] != 1234) return 51;
+    checks = 0;
+    block[128] = 1234;
+    if (Render(fadeExcerpt, 3, 48000, 50000, 240000, 128, block, CancelDuringBlock, &checks, 2) ||
+        block[0] != 10000 || block[126] != 10000 || block[127] != -10000 || block[128] != 1234) return 52;
+    const int16_t limits[] = {1000, -1000, 32767, -32768};
+    if (!Render(limits, 2, 48000, 48000, 240000, 1, excerptOutput, nullptr, nullptr, 1) ||
+        excerptOutput[0] != 32767 || excerptOutput[1] != -32768) return 53;
+    const int16_t userMusic[] = {1200, -1200, 2400, -2400, 3600, -3600, 4800, -4800};
+    const uint64_t recipeOffset = uint64_t(48000) * neo::movie::MUSIC_START_SECONDS;
+    if (!Render(userMusic, 4, 48000, 48000, 240000, 4, excerptOutput, nullptr, nullptr, recipeOffset)) return 55;
+    for (unsigned i = 0; i < 8; ++i) if (excerptOutput[i] != userMusic[i]) return 56;
+    return RunSourceDurationTests();
+}
+
+// Keep this independent of the large render fixtures above: the Windows
+// freestanding executable intentionally links without CRT stack-probe helpers.
+__attribute__((noinline)) static int RunSourceDurationTests()
+{
+    using neo::movie::audio::PlanSourceDuration;
+    using neo::movie::audio::ApplySourceDurationPlan;
+    using neo::movie::audio::SourceDurationStatus;
+    // Real phone decode, 2026-11-10: 34.536s PCM vs 34.392s metadata.
+    // Both sides reached EOS; retain declared frames and discard exactly 6912.
+    const auto phoneSource = PlanSourceDuration(1657728, 48000, 34392000, true, true);
+    if (!phoneSource.Accepted() || phoneSource.expectedFrames != 1650816 ||
+        phoneSource.retainedFrames != 1650816 || phoneSource.trimmedFrames != 6912 ||
+        phoneSource.status != SourceDurationStatus::TrimmedTail) return 57;
+    TestStereoPcm phonePcm{1657728 * 2};
+    if (!ApplySourceDurationPlan(phonePcm, phoneSource) || phonePcm.count != 1650816 * 2 ||
+        phonePcm.resizes != 1) return 58;
+    const auto exactSource = PlanSourceDuration(48000, 48000, 1000000, true, true);
+    if (!exactSource.Accepted() || exactSource.status != SourceDurationStatus::Exact ||
+        exactSource.retainedFrames != 48000 || exactSource.trimmedFrames) return 59;
+    // The excess ceiling is 250ms of source samples, independent of song length.
+    const int sourceRates[] = {8000, 8001, 44100, 44101, 48000, 96000, 192000};
+    for (const int rate : sourceRates) {
+        const uint64_t expected = static_cast<uint64_t>(rate);
+        const uint64_t tail = static_cast<uint64_t>(rate) / 4;
+        const auto boundary = PlanSourceDuration(expected + tail, rate, 1000000, true, true);
+        const auto over = PlanSourceDuration(expected + tail + 1, rate, 1000000, true, true);
+        if (!boundary.Accepted() || boundary.retainedFrames != expected || boundary.trimmedFrames != tail ||
+            over.Accepted() || over.status != SourceDurationStatus::ExcessiveTail) return 60;
+    }
+    if (PlanSourceDuration(28800000 + 24000, 48000, 600000000, true, true).Accepted()) return 61;
+    const auto shortBoundary = PlanSourceDuration(48000 - 1152, 48000, 1000000, true, true);
+    if (!shortBoundary.Accepted() || shortBoundary.status != SourceDurationStatus::ShortWithinFrame ||
+        shortBoundary.retainedFrames != 48000 - 1152 || shortBoundary.trimmedFrames ||
+        PlanSourceDuration(48000 - 1153, 48000, 1000000, true, true).Accepted()) return 62;
+    // An accepted short source is never filled or extended with fabricated PCM.
+    TestStereoPcm shortPcm{(48000 - 1152) * 2};
+    if (!ApplySourceDurationPlan(shortPcm, shortBoundary) || shortPcm.count != (48000 - 1152) * 2) return 63;
+    const int incompleteEosCases[] = {0, 1, 2};
+    for (const int bits : incompleteEosCases) {
+        const auto incomplete = PlanSourceDuration(1657728, 48000, 34392000, bits & 1, bits & 2);
+        TestStereoPcm untouched{1657728 * 2};
+        if (incomplete.Accepted() || incomplete.status != SourceDurationStatus::IncompleteEos ||
+            ApplySourceDurationPlan(untouched, incomplete) || untouched.resizes) return 64;
+    }
+    if (PlanSourceDuration(0, 48000, 1000000, true, true).Accepted() ||
+        PlanSourceDuration(UINT64_MAX, 48000, 1000000, true, true).Accepted() ||
+        PlanSourceDuration(neo::movie::audio::MAX_SOURCE_PCM_FRAMES + 1, 48000, 1000000, true, true).Accepted()) return 65;
+    const uint64_t memoryBound = neo::movie::audio::MAX_SOURCE_PCM_FRAMES;
+    if (!PlanSourceDuration(memoryBound, 48000, static_cast<int64_t>(memoryBound * 1000000 / 48000),
+        true, true).Accepted()) return 71;
+    const int invalidRates[] = {0, -1, 7999, 192001};
+    for (const int rate : invalidRates) {
+        if (PlanSourceDuration(48000, rate, 1000000, true, true).Accepted()) return 66;
+    }
+    const int64_t invalidDurations[] = {0, -1, INT64_MAX, neo::movie::audio::MAX_SOURCE_DURATION_US + 1};
+    for (const int64_t duration : invalidDurations) {
+        if (PlanSourceDuration(48000, 48000, duration, true, true).Accepted()) return 67;
+    }
+    // Ceil the source duration to whole PCM frames; do not lose the last sample.
+    const auto fractionalDuration = PlanSourceDuration(3, 44100, 23, true, true);
+    if (!fractionalDuration.Accepted() || fractionalDuration.expectedFrames != 2 ||
+        fractionalDuration.retainedFrames != 2 || fractionalDuration.trimmedFrames != 1) return 68;
+    TestStereoPcm wrongSize{phoneSource.rawFrames * 2 - 1};
+    if (ApplySourceDurationPlan(wrongSize, phoneSource) || wrongSize.resizes) return 69;
+    // The render loop receives the retained size, so a discarded tail cannot
+    // reappear when the selected source loops; fades remain on the movie clock.
+    const int16_t trimmedSource[] = {1200, -1200, -30000, 30000};
+    int16_t retainedOutput[2];
+    const auto tinySource = PlanSourceDuration(2, 8000, 125, true, true);
+    TestStereoPcm tinyPcm{4};
+    if (!ApplySourceDurationPlan(tinyPcm, tinySource) || tinyPcm.count != 2 ||
+        !Render(trimmedSource, tinyPcm.count / 2, 8000, 48000, 240000, 1, retainedOutput, nullptr, nullptr) ||
+        retainedOutput[0] != 1200 || retainedOutput[1] != -1200) return 70;
     return 0;
 }
 

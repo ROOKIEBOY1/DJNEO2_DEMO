@@ -1,4 +1,5 @@
 import { SubjectBox } from './SubjectObservation';
+import { SubjectTaskSnapshot } from './SubjectTaskWorkflow';
 
 // Preview geometry only. Never use this box for candidate selection or flight control.
 export function subjectFramePresentation(box: SubjectBox): SubjectBox | undefined {
@@ -15,6 +16,14 @@ export function subjectFramePresentation(box: SubjectBox): SubjectBox | undefine
   return { id: box.id, left: left, top: top, width: width, height: height };
 }
 
-export function showSubjectFrame(stage: string, confirmed: boolean): boolean {
-  return !confirmed && (stage === 'selecting' || stage === 'confirm');
+export function showSubjectFrame(stage: string): boolean {
+  return stage === 'confirm';
+}
+
+export function selectedSubjectFrames(task: SubjectTaskSnapshot, overlay: SubjectBox[]): SubjectBox[] {
+  if (!showSubjectFrame(task.stage) || task.subjectId === undefined) return [];
+  const source = overlay.find((box: SubjectBox): boolean => box.id === task.subjectId);
+  if (source === undefined) return [];
+  const frame = subjectFramePresentation(source);
+  return frame === undefined ? [] : [frame];
 }

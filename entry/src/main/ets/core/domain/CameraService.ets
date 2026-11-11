@@ -100,13 +100,28 @@ export class CameraService {
         const synced = await this.synchronizeClock(token);
         if (!synced.ok) return synced;
       }
-      this.ensureNotCancelled(token); this.requireIdle();
+      this.ensureNotCancelled(token); this.ensureFresh(); this.requireIdle();
+      const telemetry = this.session.snapshot().telemetry;
+      const before = cameraStateDescription(telemetry);
+      if (telemetry.camera?.modeRaw === 1 && telemetry.camera.timeSynchronized === true) {
+        hilog.info(0, 'NeoCamera', '复用已确认的录像待机模式：%{public}s', before);
+        return success('录像模式已观察确认');
+      }
+      validateCameraRequest(0xff, VIDEO_MODE);
       const sentAt = Date.now();
       const reply = await this.session.requestNative(1, 2, 0xff, VIDEO_MODE, 2000, token);
-      if (!successReply(reply)) throw new Error('相机录像模式设置未获成功回复');
+      hilog.info(0, 'NeoCamera',
+        '录像模式切换 reply=%{public}s，before={%{public}s}，after={%{public}s}',
+        replyDescription(reply), before, cameraStateDescription(this.session.snapshot().telemetry));
+      if (!successReply(reply)) throw new Error(`相机录像模式设置未获成功回复：${replyDescription(reply)}`);
       await this.waitCameraMode(1, sentAt, token);
       return success('录像模式已观察确认');
-    } catch (error) { return failure(ErrorLayer.TASK, 'VIDEO_MODE_NOT_OBSERVED', errorMessage(error)); }
+    } catch (error) {
+      const message = errorMessage(error);
+      hilog.warn(0, 'NeoCamera', '录像模式准备失败：%{public}s，state={%{public}s}',
+        message, cameraStateDescription(this.session.snapshot().telemetry));
+      return failure(ErrorLayer.TASK, 'VIDEO_MODE_NOT_OBSERVED', message);
+    }
     finally { this.operationActive = false; }
   }
 
@@ -315,6 +330,12 @@ function successReply(reply?: Uint8Array): boolean {
 function replyDescription(reply?: Uint8Array): string {
   return reply === undefined ? 'timeout (no matching reply)' :
     `0x${toHex(reply)} (${reply.length} byte${reply.length === 1 ? '' : 's'})`;
+}
+
+function cameraStateDescription(telemetry: TelemetrySnapshot): string {
+  const camera = telemetry.camera;
+  return `mode=${camera?.modeRaw ?? '--'}, ageMs=${telemetry.cameraAgeMs ?? '--'}, ` +
+    `synced=${camera?.timeSynchronized ?? '--'}, recording=${camera?.recordingCandidate ?? '--'}`;
 }
 
 function delay(milliseconds: number): Promise<void> {

@@ -1,5 +1,5 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { concatBytes, fromHex, readU16LE, toHex, writeU16LE, writeU32LE } from '../protocol/Bytes';
+import { bytesEqual, concatBytes, fromHex, readU16LE, toHex, writeU16LE, writeU32LE } from '../protocol/Bytes';
 import { OBSERVED_TRAILER_PREFIX, TRAILER_SUFFIX } from '../protocol/CommandCodec';
 import { encodeDumlFrame } from '../protocol/DumlCodec';
 import { sha256Hex } from '../protocol/Sha256';
@@ -81,6 +81,8 @@ export class RegistrationExchange {
   private requestCount: number = 0;
   private schemaResponseCount: number = 0;
   private unknownRequestCount: number = 0;
+  private aircraftIdentity?: Uint8Array;
+  private identityDeferred: boolean = false;
 
   constructor(startedAtMs: number, profile: RegistrationProfile) {
     this.startedAt = startedAtMs;
@@ -95,6 +97,8 @@ export class RegistrationExchange {
     }
     const payload = new Uint8Array(frame.slice(11, frame.length - 2));
     if (frame[10] === 0x13 && payload.length === 55) {
+      const identity = payload.slice(1, 24);
+      if (isAircraftIdentity(identity) && !this.rememberAircraftIdentity(identity)) return;
       this.remoteState = new Uint8Array(payload.slice(24, 27));
       this.remoteTail = new Uint8Array(payload.slice(52, 55));
       return;
@@ -112,12 +116,25 @@ export class RegistrationExchange {
         template = candidate;
       } else if (frame[10] === 6) {
         const candidate = this.requiredTemplate('response_06:51:0000');
-        responsePayload = identityAcknowledgement(payload, fromHex(candidate.payloadHex));
+        responsePayload = identityAcknowledgement(payload, fromHex(candidate.payloadHex), 51);
+        template = candidate;
+      } else if (frame[10] === 8) {
+        const candidate = this.requiredTemplate('response_08:49:0000');
+        responsePayload = identityAcknowledgement(payload, fromHex(candidate.payloadHex), 49);
+        const localIdentity = fromHex(this.requiredTemplate('identity').payloadHex);
+        if (!bytesEqual(payload.slice(23, 46), localIdentity.slice(0, 23))) {
+          throw new Error('Identity request names a different local client');
+        }
         template = candidate;
       }
     } catch (_) {
       responsePayload = undefined;
       template = undefined;
+    }
+    if (responsePayload !== undefined && (frame[10] === 6 || frame[10] === 8) &&
+      !this.rememberAircraftIdentity(payload.slice(0, 23))) {
+      this.unknownRequestCount++;
+      return;
     }
     if (template === undefined) {
       const key = `${frame[10].toString(16).padStart(2, '0')}:${sha256Hex(payload)}`;
@@ -157,9 +174,18 @@ export class RegistrationExchange {
     while (this.schedule.length > 0 && nowMs - this.startedAt >= this.schedule[0].delayMs) {
       const scheduled = this.schedule.shift();
       if (scheduled !== undefined) {
+        if (scheduled.name === 'identity' && this.aircraftIdentity === undefined) {
+          this.identityDeferred = true;
+          continue;
+        }
         result.push(encodeRegistrationMessage(this.requiredTemplate(scheduled.name), nextSequence(),
-          nextOuterSequence()));
+          nextOuterSequence(), scheduled.name === 'identity' ? this.currentIdentityPayload() : undefined));
       }
+    }
+    if (this.identityDeferred && this.aircraftIdentity !== undefined) {
+      result.push(encodeRegistrationMessage(this.requiredTemplate('identity'), nextSequence(),
+        nextOuterSequence(), this.currentIdentityPayload()));
+      this.identityDeferred = false;
     }
     if (nowMs >= this.heartbeatAt) {
       const heartbeat = this.requiredTemplate('heartbeat');
@@ -186,6 +212,29 @@ export class RegistrationExchange {
       schemaResponses: this.schemaResponseCount,
       unknownRequests: this.unknownRequestCount
     };
+  }
+
+  private rememberAircraftIdentity(identity: Uint8Array): boolean {
+    if (!isAircraftIdentity(identity)) return false;
+    if (this.aircraftIdentity !== undefined) {
+      const matches = bytesEqual(this.aircraftIdentity, identity);
+      if (!matches) hilog.warn(LOG_DOMAIN, LOG_TAG, 'Ignoring conflicting aircraft identity in the current session');
+      return matches;
+    }
+    this.aircraftIdentity = new Uint8Array(identity);
+    hilog.info(LOG_DOMAIN, LOG_TAG, 'Current aircraft registration identity learned suffix=%{public}s',
+      toHex(identity.slice(18)));
+    return true;
+  }
+
+  private currentIdentityPayload(): Uint8Array {
+    const payload = fromHex(this.requiredTemplate('identity').payloadHex);
+    if (this.aircraftIdentity === undefined || payload.length !== 51 ||
+      !isAircraftIdentity(payload.slice(23, 46))) {
+      throw new Error('Current aircraft identity or supported registration template is unavailable');
+    }
+    payload.set(this.aircraftIdentity, 23);
+    return payload;
   }
 
   private requiredTemplate(name: string): RegistrationTemplateDefinition {
@@ -248,14 +297,19 @@ function channelAcknowledgement(payload: Uint8Array, template: Uint8Array): Uint
   return result;
 }
 
-function identityAcknowledgement(payload: Uint8Array, template: Uint8Array): Uint8Array {
-  if (payload.length !== 51 || template.length !== 24 || payload[0] !== 0 || payload[1] !== 0) {
-    throw new Error('Identity request does not match this aircraft');
+function isAircraftIdentity(value: Uint8Array): boolean {
+  if (value.length !== 23 || value[0] !== 0 || value[1] !== 0 || value[2] !== 0x24) return false;
+  for (let index = 3; index < 23; index++) {
+    const byte = value[index];
+    if (!((byte >= 0x30 && byte <= 0x39) || (byte >= 0x41 && byte <= 0x5a))) return false;
   }
-  for (let index = 0; index < 23; index++) {
-    if (payload[index] !== template[index]) {
-      throw new Error('Identity request does not match this aircraft');
-    }
+  return true;
+}
+
+function identityAcknowledgement(payload: Uint8Array, template: Uint8Array, length: number): Uint8Array {
+  if (payload.length !== length || template.length !== 24 ||
+    !isAircraftIdentity(payload.slice(0, 23)) || !isAircraftIdentity(template.slice(0, 23))) {
+    throw new Error('Unsupported aircraft identity request');
   }
   return concatBytes(payload.slice(0, 23), new Uint8Array([0]));
 }

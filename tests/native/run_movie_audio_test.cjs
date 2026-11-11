@@ -13,4 +13,4 @@ if (build.status !== 0) {
 }
 const result = spawnSync(output, [], { encoding: 'utf8' });
 assert.equal(result.status, 0, `PCM fixture failed (exit identifies assertion): ${result.error || result.stderr}`);
-console.log('Movie audio: PCM stride/format, stereo resample, loop, short/long fade, cancellation, AAC ADTS and complete output timeline passed.');
+console.log('Movie audio: PCM stride/format, stereo resample, loop, short/long fade, cancellation, AAC ADTS and complete output timeline passed; source double-EOS, 144ms trim, fixed 250ms/+1-sample boundaries, shortfall and invalid-input checks passed (assertions 1-71).');

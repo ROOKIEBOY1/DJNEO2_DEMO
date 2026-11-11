@@ -28,7 +28,7 @@ test('agent schema accepts supported actions and rejects invalid parameters and 
   ]) assert.throws(() => validateAgentAction(action, observation));
   assert.throws(() => validateAgentAction({ action: 'select_subject', subjectId: 11 }, { ...observation, frame: undefined }));
   validateAgentAction({ action: 'photo' }, { ...observation, frame: undefined });
-  assert.equal(agentNeedsConfirmation({ action: 'move' }), true);
+  assert.equal(agentNeedsConfirmation({ action: 'move' }), false);
   assert.equal(agentNeedsConfirmation({ action: 'circle' }), true);
   assert.equal(agentNeedsConfirmation({ action: 'photo' }), false);
 });
@@ -113,14 +113,14 @@ test('text planning may take up to one minute while visual decisions keep their 
   assert.throws(() => validateAgentResponse(response, textObservation, 10, 3, 31000));
 });
 
-test('a slow text decision still receives a usable local confirmation window', async () => {
-  const { c, obs } = agentController();
+test('a valid text-only movement decision executes its specified duration directly', async () => {
+  const { c, calls, obs } = agentController();
   const textObservation = { ...obs, frame: undefined, requestedAtMs: Date.now() - 30000 };
-  const response = { version: 2, requestId: 'r1', command: { action: 'move', direction: 'left' } };
+  const response = { version: 2, requestId: 'r1', command: { action: 'move', direction: 'left', seconds: 1 } };
   const outcome = await c.acceptAgentResponse(textObservation, response);
-  assert.equal(outcome.confirmationRequired, true);
-  assert.ok(c.pendingAgentAction.expiresAt > Date.now());
-  assert.ok(c.pendingAgentAction.expiresAt <= Date.now() + 10000);
+  assert.equal(outcome.confirmationRequired, undefined);
+  assert.equal(c.pendingAgentAction,undefined);
+  assert.deepEqual(calls,[{direction:'left',seconds:1}]);
 });
 
 
@@ -180,31 +180,57 @@ test('phone cloud request rejects a response when the control generation changes
   await assert.rejects(c.requestCloudAgentAction(obs,'拍照'),/取消|变化/);
 });
 
-test('movement waits for independent confirmation, consumes it once and rejects duplicate responses', async () => {
+test('movement executes once without another confirmation and rejects duplicate responses', async () => {
   const { c, calls, obs } = agentController();
-  const response = { version: 2, requestId: 'r1', command: { action: 'move', direction: 'left' } };
-  const pending = await c.acceptAgentResponse(obs, response);
-  assert.equal(pending.confirmationRequired, true);
-  assert.deepEqual(calls, []);
+  const response = { version: 2, requestId: 'r1', command: { action: 'move', direction: 'left', seconds: 1.5 } };
+  const result = await c.acceptAgentResponse(obs, response);
+  assert.equal(result.confirmationRequired,undefined);
+  assert.equal(c.pendingAgentAction,undefined);
+  assert.deepEqual(calls,[{direction:'left',seconds:1.5}]);
   await assert.rejects(c.acceptAgentResponse(obs, response), /已处理/);
-  await c.confirmAgentAction();
-  assert.deepEqual(calls, [{ direction: 'left', seconds: 0.5 }]);
+  assert.equal(calls.length,1);
   await assert.rejects(c.confirmAgentAction(), /没有有效/);
 });
 
-test('cancellation, expired confirmation and flight generation changes suppress movement', async () => {
+test('cancellation, expired responses and flight generation changes suppress direct movement', async () => {
   for (const invalidate of [
     c => c.cancelAgentAction(),
-    c => { c.pendingAgentAction.expiresAt = Date.now() - 1; },
+    (c,obs) => { obs.requestedAtMs=Date.now()-20001; },
     c => { c.flight.snapshot = () => ({ generation: 3 }); }
   ]) {
     const { c, calls, obs } = agentController();
-    await c.acceptAgentResponse(obs, { version: 2, requestId: 'r1',
-      command: { action: 'move', direction: 'up', seconds: 1 } });
-    invalidate(c);
-    await assert.rejects(c.confirmAgentAction());
+    invalidate(c,obs);
+    await assert.rejects(c.acceptAgentResponse(obs, { version: 2, requestId: 'r1',
+      command: { action: 'move', direction: 'up', seconds: 1 } }));
     assert.deepEqual(calls, []);
   }
+});
+
+test('all eight directions preserve different VLM durations instead of replacing them with the slider',async()=>{
+  const directions=['forward','backward','left','right','up','down','turn_left','turn_right'];
+  for(const [index,direction] of directions.entries()){
+    const {c,calls,obs}=agentController();obs.context.movementSeconds=4;
+    const seconds=[.1,.3,.5,1,1.5,2,3,10][index];
+    const result=await c.acceptAgentResponse(obs,{version:2,requestId:'r1',command:{action:'move',direction,seconds}});
+    assert.deepEqual(calls,[{direction,seconds}]);assert.equal(result.confirmationRequired,undefined);
+    assert.equal(c.pendingAgentAction,undefined);
+  }
+});
+
+test('missing or invalid model movement duration never falls back to a default or sends a motion',async()=>{
+  for(const seconds of [undefined,0,-1,.09,10.01,NaN,Infinity,'2']){
+    const {c,calls,obs}=agentController();obs.context.movementSeconds=.5;
+    await assert.rejects(c.acceptAgentResponse(obs,{version:2,requestId:'r1',
+      command:{action:'move',direction:'forward',...(seconds===undefined?{}:{seconds})}}),/时长/);
+    assert.deepEqual(calls,[]);assert.equal(c.pendingAgentAction,undefined);
+  }
+});
+
+test('a busy controller never queues a direct movement for later execution',async()=>{
+  const {c,calls,obs}=agentController();c.busyValue=true;
+  await assert.rejects(c.acceptAgentResponse(obs,{version:2,requestId:'r1',
+    command:{action:'move',direction:'forward',seconds:1}}),/执行|操作/);
+  assert.deepEqual(calls,[]);assert.equal(c.pendingAgentAction,undefined);
 });
 
 test('a failed target selection prevents the airborne dolly start', async () => {
@@ -260,11 +286,17 @@ test('a single airborne request prepares new dolly parameters, reselects its tar
   }
 });
 
-test('independent follow requires confirmation before any preparation or flight request', async () => {
+test('independent follow enters the shared subject confirmation instead of generic flight confirmation', async () => {
   const { c, obs } = agentController();
+  let entered=0;c.session.snapshot=()=>({telemetry:{flight:{motorsOn:true}}});
+  c.groundDolly=new (require('../entry/src/main/ets/core/domain/SubjectTaskWorkflow.ets').SubjectTaskWorkflow)(()=>{});
+  c.startGroundDolly=async(description,intent,original,entry,inferred)=>{
+    entered++;assert.equal(intent.action,'follow');assert.equal(original,obs);assert.equal(entry,'hover');
+    assert.equal(inferred.subjectId,13);return {message:'请确认主体',confirmationRequired:true};
+  };
   const result = await c.acceptAgentResponse(obs, {version:2,requestId:'r1',command:{action:'follow',subjectId:13}});
   assert.equal(result.confirmationRequired, true);
-  assert.equal(c.pendingAgentAction.command.action, 'follow');
+  assert.equal(entered,1);assert.equal(c.pendingAgentAction,undefined);
 });
 
 test('another airborne dolly hands off the completed task before changing parameters or preparing', async () => {

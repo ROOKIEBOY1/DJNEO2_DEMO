@@ -2,12 +2,10 @@ import * as nativeMovie from 'libneovideo.so';
 import { common } from '@kit.AbilityKit';
 import { fileIo, fileUri } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
-import { MovieExportPort, NativeMovieSnapshot, MovieCompositionSnapshot } from '../media/MovieComposer';
+import { MovieExportPort, NativeMovieSnapshot, MovieCompositionSnapshot, MOVIE_TEMPLATE_VERSION } from '../media/MovieComposer';
 
-export const TITAN_CREDIT: string = "'Titan' by Scott Buckley - released under CC-BY 4.0. www.scottbuckley.com.au";
-export const TITAN_SOURCE: string = 'https://www.scottbuckley.com.au/library/titan/';
-export const TITAN_LICENSE: string = 'https://creativecommons.org/licenses/by/4.0/';
-export const TITAN_CHANGES: string = '音乐已按视频时长截取、循环并加入淡入淡出。';
+export const MOVIE_MUSIC_NAME: string = '自选音轨';
+export const MOVIE_MUSIC_DESCRIPTION: string = '配乐来自提供的视频，从片段开头播放，按成片时长截取或循环，并加入淡入淡出。';
 
 export interface MovieCacheRecord {
   version: number;
@@ -51,11 +49,11 @@ export class NativeMovieFiles {
   }
 
   async prepareMusic(context: common.UIAbilityContext, directory: string): Promise<string> {
-    const destination = `${directory}/titan-scott-buckley-v1.mp3`;
-    // Exact known official asset size; a previous interrupted copy is not accepted.
-    try { if (fileIo.statSync(destination).size === 7034419) return destination; } catch (_) { }
-    const music = await context.resourceManager.getRawFileContent('titan.mp3');
-    if (music.byteLength !== 7034419) throw new Error('内置Titan配乐不完整，请更新应用');
+    const destination = `${directory}/movie-bgm-user-v1.mp3`;
+    // Versioned source and exact size prevent reusing old music or a partial copy.
+    try { if (fileIo.statSync(destination).size === 828908) return destination; } catch (_) { }
+    const music = await context.resourceManager.getRawFileContent('movie-bgm-user-v1.mp3');
+    if (music.byteLength !== 828908) throw new Error('内置配乐不完整，请更新应用');
     const temporary = `${destination}.part`;
     this.writeBytes(temporary, music);
     fileIo.renameSync(temporary, destination);
@@ -64,6 +62,7 @@ export class NativeMovieFiles {
 
   saveCompleted(directory: string, movie: MovieCompositionSnapshot, revision: string): void {
     if (movie.stage !== 'completed' || movie.outputPath.length === 0 || movie.durationMs <= 0) return;
+    if (!movie.sourceKey.startsWith(MOVIE_TEMPLATE_VERSION + '|')) return;
     if (!this.validMovie(movie.outputPath, directory)) return;
     const record: MovieCacheRecord = { version: 1, sourceKey: movie.sourceKey, sources: movie.sources.slice(),
       revision: revision, outputPath: movie.outputPath, durationMs: movie.durationMs, size: fileIo.statSync(movie.outputPath).size };
@@ -86,7 +85,8 @@ export class NativeMovieFiles {
     try {
       if (fileIo.statSync(path).size > 65536) return undefined;
       const record = JSON.parse(fileIo.readTextSync(path)) as MovieCacheRecord;
-      if (record.version !== 1 || typeof record.sourceKey !== 'string' || !Array.isArray(record.sources) ||
+      if (record.version !== 1 || typeof record.sourceKey !== 'string' ||
+        !record.sourceKey.startsWith(MOVIE_TEMPLATE_VERSION + '|') || !Array.isArray(record.sources) ||
         record.sources.length < 1 || record.sources.length > 8 || !record.sources.every((uri: string) => typeof uri === 'string') ||
         typeof record.outputPath !== 'string' || typeof record.revision !== 'string' ||
         !Number.isFinite(record.durationMs) || record.durationMs <= 0 || !Number.isFinite(record.size) || record.size <= 16 ||

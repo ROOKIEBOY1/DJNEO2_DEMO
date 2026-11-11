@@ -16,6 +16,8 @@ import { GalleryVideoReceiver } from '../media/GalleryVideoReceiver';
 import { systemGalleryPort } from '../platform/SystemGallery';
 import { CloudVlmKeyStore } from '../platform/CloudVlmKeyStore';
 import { CloudVlmClient } from '../platform/CloudVlmClient';
+import { SelfReferencePhotoStore } from '../platform/SelfReferencePhotoStore';
+import { isSelfSubjectRequest } from './SelfReference';
 import { CaptureMedia } from '../media/CaptureMedia';
 import { MediaDownloadResult } from '../media/MediaDownloader';
 import { CancellationToken, ErrorLayer, failure, OperationResult, success } from './OperationResult';
@@ -25,19 +27,21 @@ import { Context } from '@kit.AbilityKit';
 import { LocalSpeechRecognizer } from '../platform/LocalSpeechRecognizer';
 import { AircraftProfileStore, AircraftProfileSummary } from '../profile/AircraftProfileStore';
 import { NeoWifiLink } from '../platform/NeoWifiLink';
-import { SubjectBox, selectedSubjectOverlay } from './SubjectObservation';
-import { GroundDollyWorkflow, GroundDollySnapshot, GroundDollyPort } from './GroundDollyWorkflow';
+import { SubjectBox, SubjectSnapshot, selectedSubjectOverlay } from './SubjectObservation';
+import { SubjectTaskWorkflow, SubjectTaskSnapshot, SubjectTaskPort } from './SubjectTaskWorkflow';
 import { normalizeDroneUtterance } from './VoiceUtterance';
 import { CloseupSequence, CloseupSequenceSnapshot, CloseupSequencePort } from './CloseupSequence';
 import { CloseupMediaGroup } from '../media/CloseupMediaGroup';
 import { CloseupSubjectGuard } from './CloseupSubjectGuard';
+import { MovementStep, runMovementSequence } from './MovementSequence';
 import { MovieComposer, MovieCompositionSnapshot } from '../media/MovieComposer';
-import { movieSourceReady } from '../media/MovieEligibility';
+import { movieMediaReady, movieSourceReady } from '../media/MovieEligibility';
 import { NativeMovieFiles, nativeMoviePort } from '../platform/NativeMovieExport';
 import { image } from '@kit.ImageKit';
-import { canApplyVlmSelection, closestFrameSubjects, markVlmCandidates, trackedSubjectId, VlmFrame } from '../media/VlmFrame';
+import { canApplyVlmSelection, FrameSubjectChangedError, matchFrameSubjects, markVlmCandidates,
+  trackedSubjectId, VlmFrame } from '../media/VlmFrame';
 import { AgentAction, AgentObservation, AgentOutcome, AgentResponse, DirectFlightAction, parseDirectFlightVoice, parseDirectStopVoice, agentActionLabel, agentNeedsConfirmation,
-  agentObservationTimeoutMs, validateAgentAction, validateAgentResponse } from './AgentAction';
+  actionNeedsSubjectSelection, agentObservationTimeoutMs, validateAgentAction, validateAgentResponse } from './AgentAction';
 
 export interface ConsoleSnapshot {
   movie: MovieCompositionSnapshot;
@@ -45,11 +49,15 @@ export interface ConsoleSnapshot {
   movieSaving: boolean;
   movieCanCompose: boolean;
   closeup: CloseupSequenceSnapshot;
-  groundDolly: GroundDollySnapshot;
+  subjectTask: SubjectTaskSnapshot;
+  groundDolly: SubjectTaskSnapshot;
   dollyDemo: DollyDemoSnapshot;
   aircraftProfiles: AircraftProfileSummary[];
   selectedAircraftId: string;
   wifiProgress: string;
+  connectionReady: boolean;
+  connectionFrameReady: boolean;
+  connectionRecovering: boolean;
   session: DroneSessionSnapshot;
   flight: FlightCommandSnapshot;
   circlePrepared: boolean;
@@ -108,7 +116,8 @@ export class AppController {
   private movieTimer?: number;
   private readonly closeupSequence = new CloseupSequence((): void => this.emit());
   private readonly closeupMedia = new CloseupMediaGroup();
-  private readonly groundDolly = new GroundDollyWorkflow((): void => this.emit());
+  // Legacy field/API aliases share this single generic owner; no dolly-only selection state remains.
+  private readonly groundDolly = new SubjectTaskWorkflow((): void => this.emit());
   readonly video: VideoPreview = new VideoPreview(nativeVideo);
   readonly session: DroneSession;
   readonly flight: FlightCommandService;
@@ -126,6 +135,10 @@ export class AppController {
   private videoDiagnosticsAt: number = 0;
   private previewMaxLagMs: number = 0;
   private videoSessionEnabled: boolean = false;
+  private connectionRecoveryReason: string = '';
+  private readyConnectionSession?: number;
+  private connectionAttempt?: Promise<void>;
+  private connectionEpoch: number = 0;
   private hoverScanAttempted: boolean = false;
   private autoScanGeneration: number = -1;
   private autoScanRequestedGeneration: number = -1;
@@ -138,6 +151,7 @@ export class AppController {
   private selectedSubjectId?: number;
   private vlmFramePending: boolean = false;
   private agentGeneration: number = 0;
+  private movementSequenceToken?: CancellationToken;
   private agentRequestSequence: number = 0;
   private latestAgentRequestId: string = '';
   private acceptedAgentRequestId: string = '';
@@ -150,7 +164,7 @@ export class AppController {
   private agentVideoResultReady: boolean = false;
   private agentMediaIndex: number = 0;
   private readonly cloudKeys: CloudVlmKeyStore = new CloudVlmKeyStore();
-  private readonly cloudVlm: CloudVlmClient = new CloudVlmClient(this.cloudKeys);
+  private readonly cloudVlm: CloudVlmClient;
   private cloudInitialized: boolean = false;
   private cloudInitialization?: Promise<void>;
   private cloudVlmConfigured: boolean = false;
@@ -181,6 +195,14 @@ export class AppController {
 
   constructor(filesDirectory: string, context: Context) {
     this.outputDirectory = filesDirectory;
+    try {
+      if (typeof nativeVideo.setDiagnosticDirectory === 'function') {
+        const directory = `${filesDirectory}/video-diagnostics`;
+        if (!fileIo.accessSync(directory)) fileIo.mkdirSync(directory);
+        nativeVideo.setDiagnosticDirectory(directory);
+      }
+    } catch (error) { this.log(`视频诊断目录未启用：${asError(error).message}`); }
+    this.cloudVlm = new CloudVlmClient(this.cloudKeys, new SelfReferencePhotoStore(context));
     this.profiles = new AircraftProfileStore(filesDirectory);
     this.session = new DroneSession();
     this.flight = new FlightCommandService(this.session);
@@ -260,11 +282,15 @@ export class AppController {
       movie: this.movieComposer.snapshot(), moviePreparing: this.moviePreparing, movieSaving: this.movieSaving,
       movieCanCompose: false,
       closeup: this.closeupSequence.snapshot(),
+      subjectTask: this.groundDolly.snapshot(),
       groundDolly: this.groundDolly.snapshot(),
       dollyDemo: { stage: this.demoStage, message: this.demoMessage, videoUri: this.demoVideoUri, candidate: candidate },
       aircraftProfiles: this.profiles.list(),
       selectedAircraftId: this.profiles.selectedId(),
       wifiProgress: this.wifiProgressValue,
+      connectionReady: this.connectionControlReady(),
+      connectionFrameReady: this.previewReady(),
+      connectionRecovering: this.connectionAttempt !== undefined,
       session: session,
       flight: this.flight.snapshot(),
       circlePrepared: circle.prepared,
@@ -339,11 +365,11 @@ export class AppController {
       const music = await this.movieFiles.prepareMusic(context, this.outputDirectory);
       if (epoch !== this.moviePreparationEpoch) return;
       this.syncMovieSources();
-      if (this.movieComposer.snapshot().sourceKey !== before.sourceKey || !movieSourceReady(this.snapshot())) {
+      if (this.movieComposer.snapshot().sourceKey !== before.sourceKey || !movieMediaReady(this.snapshot())) {
         throw new Error('本次素材已变更，请对当前拍摄结果重新一键成片');
       }
       this.movieComposer.start(this.movieFiles.newOutputPath(this.outputDirectory), music);
-      this.log('小艺开始本地一键成片，配乐Titan；保留全部原片');
+      this.log('小艺开始本地一键成片，使用自选音轨；保留全部原片');
       this.ensureMoviePolling();
     } finally { this.moviePreparing = false; this.emit(); }
   }
@@ -365,7 +391,7 @@ export class AppController {
         try {
           this.movieFiles.saveCompleted(this.outputDirectory, movie, this.movieSourceRevision);
           this.movieCachedKey = movie.sourceKey;
-          this.log(`本地成片已生成，${(movie.durationMs / 1000).toFixed(1)}秒，配乐Titan`);
+          this.log(`本地成片已生成，${(movie.durationMs / 1000).toFixed(1)}秒，使用自选音轨`);
         } catch (error) { this.log(`成片已生成，缓存清单未保存：${asError(error).message}`); }
       }
       if (!movie.busy) {
@@ -465,6 +491,7 @@ export class AppController {
   }
 
   async connectSelectedAircraft(): Promise<void> {
+    const epoch = this.connectionEpoch;
     await this.run<DroneSessionSnapshot>('连接', async () => {
       try {
         const selected = this.profiles.selected();
@@ -497,6 +524,7 @@ export class AppController {
           this.agentMediaIndex = 0;
         }
         this.retireCloseup();
+        this.groundDolly?.retireInactive();
         this.agentFeedback = keepLocalResult ? '已保留本地拍摄结果，可继续播放、成片或保存至相册' : '';
         this.wifiProgressValue = '检查目标飞机 Wi-Fi';
         this.emit();
@@ -504,6 +532,10 @@ export class AppController {
           this.wifiProgressValue = message;
           this.emit();
         });
+        if (epoch !== this.connectionEpoch) {
+          await this.wifi.leave();
+          return failure<DroneSessionSnapshot>(ErrorLayer.NETWORK, 'CONNECTION_CANCELLED', '连接已取消');
+        }
         this.videoSessionEnabled = true;
         const result = await this.session.connect(runtime, selection);
         if (!result.ok) await this.wifi.leave();
@@ -515,12 +547,112 @@ export class AppController {
     });
   }
   async connect(): Promise<void> { await this.connectSelectedAircraft(); }
-  async initialize(): Promise<void> { await this.run('初始化', () => this.session.initialize()); }
+  async initialize(): Promise<void> {
+    await this.run('初始化', async () => {
+      const sessionId = this.session.sessionId();
+      // The aircraft can provide its first decodable keyframe only after the
+      // control connection is usable. Visual actions check previewReady separately.
+      const result = await this.session.initialize(15000);
+      if (this.session.sessionId() === sessionId) {
+        this.connectionRecoveryReason = result.ok ? '' : result.error?.message ?? '连接初始化未完成';
+        if (result.ok) this.readyConnectionSession = sessionId;
+      }
+      return result;
+    });
+  }
+
+  private previewReady(): boolean {
+    const preview = this.video.snapshot();
+    const stats = preview.stats;
+    return preview.state === 'live' && stats.running && !stats.waitingForKey && !stats.recoveryPaused &&
+      stats.lastRenderedAgeMs >= 0 && stats.lastRenderedAgeMs <= 1000;
+  }
+
+  private connectionHealthy(): boolean {
+    return this.connectionControlReady() && this.previewReady();
+  }
+
+  private connectionControlReady(): boolean {
+    return !this.connectionRecoveryReason && this.session.isStartupReady?.() === true;
+  }
+
+  private canRetryInitialRegistration(state: DroneSessionSnapshot): boolean {
+    const telemetry = state.telemetry;
+    if (!['registering', 'failed'].includes(state.phase) || state.deviceVerified !== false ||
+      this.readyConnectionSession === this.session.sessionId() ||
+      telemetry.flight !== undefined || telemetry.task !== undefined || telemetry.camera !== undefined) return false;
+    const flight = this.flight.snapshot();
+    const camera = this.camera.snapshot();
+    const task = this.nativeTasks.snapshot();
+    // Missing telemetry is never proof of landing. This narrowly permits a new
+    // handshake before this session has ever established control or issued an action.
+    return flight.takeoffSent === false && flight.takeoffAcknowledged === false && flight.nativeTaskMayFly === false &&
+      flight.movementActive === false && flight.landRequested === false && flight.landSent === false &&
+      flight.landAcknowledged === false && flight.nativeStartedAtMs === undefined &&
+      camera.operationActive === false && camera.recordingRequested === false &&
+      task.busy === false && task.prepared === false && task.startedAtMs === undefined &&
+      this.nativeTasks.activeOrUnknown() === false;
+  }
 
   async ensureReadyConnection(): Promise<void> {
+    if (this.connectionAttempt !== undefined) return this.connectionAttempt;
     if (this.busyValue) return;
-    const phase = this.session.snapshot().phase;
+    const attempt = this.establishReadyConnection();
+    this.connectionAttempt = attempt;
+    this.emit();
+    try { await attempt; }
+    finally {
+      if (this.connectionAttempt === attempt) this.connectionAttempt = undefined;
+      this.emit();
+    }
+  }
+
+  private async establishReadyConnection(): Promise<void> {
+    const epoch = this.connectionEpoch;
+    const state = this.session.snapshot();
+    const phase = state.phase;
+    const failedExistingSession = phase === 'failed' &&
+      (state.transport !== undefined || state.deviceVerified || state.telemetry.flight !== undefined);
+    if (phase === 'ready' || failedExistingSession) {
+      if (phase === 'ready' && this.connectionHealthy()) return;
+      await this.recoverGroundedConnection(epoch);
+      return;
+    }
     if (phase === 'disconnected' || phase === 'failed') await this.connectSelectedAircraft();
+    if (epoch !== this.connectionEpoch) return;
+    if (!this.busyValue && this.session.snapshot().phase === 'registering') {
+      await this.initialize();
+      if (epoch === this.connectionEpoch && !this.connectionHealthy() && !this.busyValue &&
+        this.session.snapshot().phase === 'registering') {
+        await this.recoverGroundedConnection(epoch);
+      }
+    }
+  }
+
+  private async recoverGroundedConnection(epoch: number): Promise<void> {
+    const state = this.session.snapshot();
+    const telemetry = state.telemetry;
+    const camera = this.camera.snapshot();
+    const groundedIdle = (telemetry.flightAgeMs ?? Infinity) <= 1000 &&
+      telemetry.flight?.airborne === false && telemetry.flight.motorsOn === false &&
+      (telemetry.cameraAgeMs ?? Infinity) <= 1000 && telemetry.camera?.recordingCandidate === false &&
+      !camera.recordingRequested && !camera.operationActive && !this.flight.snapshot().movementActive &&
+      !this.nativeTasks.activeOrUnknown();
+    if (this.busyValue || (!groundedIdle && !this.canRetryInitialRegistration(state))) {
+      this.agentFeedback = '连接尚未就绪；请确认落地停桨、录像和任务结束后，再点击连接飞机恢复';
+      this.log(this.agentFeedback); this.emit(); return;
+    }
+    this.log(`${groundedIdle ? '地面重建连接' : '初始注册未完成，重新握手'}：` +
+      `${this.connectionRecoveryReason || '图传或飞行、任务、相机状态未就绪'}`);
+    this.cancelOperations();
+    this.videoSessionEnabled = false;
+    this.video.setSession('');
+    // No flight, task or camera command is replayed. A new handshake resets both
+    // the aircraft stream session and our decoder's retained configuration.
+    await this.session.disconnect();
+    if (epoch !== this.connectionEpoch) return;
+    await this.connectSelectedAircraft();
+    if (epoch !== this.connectionEpoch) return;
     if (!this.busyValue && this.session.snapshot().phase === 'registering') await this.initialize();
   }
 
@@ -747,6 +879,7 @@ export class AppController {
       return failure<string>(ErrorLayer.TASK, 'SUBJECT_TRACK_UNCONFIRMED', '飞机已确认选择请求，但尚未回传匹配编号的跟踪框');
   }
   async disconnect(): Promise<void> {
+    this.connectionEpoch++;
     this.captureMedia.reset();
     this.videoSessionEnabled = false;
     this.video.setSession('');
@@ -775,6 +908,7 @@ export class AppController {
     await this.run('起飞请求', (token: CancellationToken) => this.flight.takeoff(true, token));
   }
   async land(): Promise<void> {
+    this.connectionEpoch++;
     const task = this.nativeTasks.snapshot();
     this.cancelOperations();
     await this.run('降落请求', async () => {
@@ -783,6 +917,7 @@ export class AppController {
     }, false);
   }
   async center(): Promise<void> {
+    this.connectionEpoch++;
     const task = this.nativeTasks.snapshot(); this.cancelOperations();
     await this.run('停止/回中', async () => {
       if (task.busy || task.prepared || task.activeOrUnknown) return this.nativeTasks.stop();
@@ -801,13 +936,25 @@ export class AppController {
   async startCircleConfirmed(): Promise<void> { await this.startNativeConfirmed('circle'); }
   async stopCircle(): Promise<void> { await this.center(); }
   async prepareNative(kind: NativeTaskKind): Promise<void> {
-    await this.run(`准备${this.taskLabel(kind)}`, (token: CancellationToken) => this.nativeTasks.prepare(kind, this.nativeConfig, token));
+    await this.run(`准备${this.taskLabel(kind)}`, (token: CancellationToken) => this.prepareNativeTask(kind, token));
+  }
+  private async prepareNativeTask(kind: NativeTaskKind, token: CancellationToken,
+    fromHover: boolean = false): Promise<OperationResult<boolean>> {
+    const sessionId = this.session.sessionId();
+    const result = fromHover ? await this.nativeTasks.prepareHover(kind, this.nativeConfig, token) :
+      await this.nativeTasks.prepare(kind, this.nativeConfig, token);
+    if (!result.ok && result.error?.code === 'NATIVE_PREPARE_FAILED' && !token.isCancelled() &&
+      this.session.sessionId() === sessionId) {
+      this.connectionRecoveryReason = result.error.message;
+      this.log(`任务参数准备失败，落地停桨后可点击连接飞机重建会话：${result.error.message}`);
+    }
+    return result;
   }
   async startNativeConfirmed(kind: NativeTaskKind): Promise<void> {
     await this.run(`启动${this.taskLabel(kind)}`, async (token: CancellationToken) => {
       const task = this.nativeTasks.snapshot();
       if (!task.prepared || task.kind !== kind) {
-        const prepared = await this.nativeTasks.prepare(kind, this.nativeConfig, token);
+        const prepared = await this.prepareNativeTask(kind, token);
         if (!prepared.ok) return failure<string>(ErrorLayer.TASK, 'NATIVE_PREPARE_REQUIRED', prepared.error?.message ?? '任务准备失败');
       }
       return this.startNativeWithCapture(token);
@@ -1024,7 +1171,8 @@ export class AppController {
     this.emit();
   }
 
-  async captureAgentObservation(waitForScan: boolean = true): Promise<AgentObservation> {
+  async captureAgentObservation(waitForScan: boolean = true, lockedSubjectId?: number,
+    allowMissingFrame: boolean = false): Promise<AgentObservation> {
     const sessionId = this.session.sessionId();
     const generation = this.flight.snapshot().generation;
     const controlGeneration = this.agentGeneration;
@@ -1032,8 +1180,17 @@ export class AppController {
     if (waitForScan) await this.waitForAutomaticSubjectScan();
     let frame: VlmFrame | undefined;
     if (this.video.snapshot().state === 'live') {
-      try { frame = await this.captureVlmFrame(); }
-      catch (error) { this.log(`动作请求未附图像：${asError(error).message}`); }
+      try { frame = await this.captureVlmFrame(lockedSubjectId); }
+      catch (error) {
+        this.log(`动作请求未附图像：${asError(error).message}`);
+        if (error instanceof FrameSubjectChangedError) throw error;
+        if (lockedSubjectId !== undefined && !allowMissingFrame) {
+          throw new Error(`未能复核已确认主体：${asError(error).message}；未启动运镜`);
+        }
+      }
+    }
+    if (lockedSubjectId !== undefined && frame === undefined && !allowMissingFrame) {
+      throw new Error('实时画面尚未就绪，未能复核已确认主体；未启动运镜');
     }
     if (sessionId !== this.session.sessionId() || generation !== this.flight.snapshot().generation ||
       controlGeneration !== this.agentGeneration || !this.session.isReliableLinkFresh()) {
@@ -1098,14 +1255,10 @@ export class AppController {
     this.acceptedAgentRequestId = observation.requestId;
     const command = response.command as AgentAction;
     this.ensureAgentObservation(observation, command);
-    if (command.action === 'move' && command.seconds === undefined) command.seconds = observation.context.movementSeconds;
-    if (command.action === 'dolly_zoom') {
-      command.framing = command.framing ?? observation.context.framing;
-      command.zoom = command.zoom ?? observation.context.zoom;
-      command.retreat = command.retreat ?? observation.context.retreat;
-    }
-    if (command.action === 'circle') command.radiusMeters = command.radiusMeters ?? observation.context.radiusMeters;
     validateAgentAction(command, observation);
+    if (actionNeedsSubjectSelection(command)) {
+      return this.beginSubjectTask(agentActionLabel(command), command, observation);
+    }
     if (agentNeedsConfirmation(command)) {
       if (this.busyValue) throw new Error('当前操作未结束，请稍后重试');
       this.pendingAgentAction = { observation: observation, command: command,
@@ -1126,7 +1279,9 @@ export class AppController {
   }
 
   cancelAgentAction(): void {
+    this.movementSequenceToken?.cancel();
     this.captureRecoveryToken?.cancel();
+    this.nativeTasks?.cancel();
     this.closeupSequence?.cancel();
     this.groundDolly?.cancel();
     this.pendingAgentAction = undefined;
@@ -1217,6 +1372,7 @@ export class AppController {
     }
     let outcome: AgentOutcome | undefined;
     let executionError = '已有操作正在执行';
+    if (command.action === 'move_sequence') this.retireInactiveFlightPresentation();
     await this.run<string>(agentActionLabel(command), async (token: CancellationToken) => {
       try {
         this.ensureAgentObservation(observation, command);
@@ -1244,7 +1400,17 @@ export class AppController {
       return { message: message };
     }
     const action = parseDirectFlightVoice(text);
+    if (action !== undefined) this.retireInactiveFlightPresentation();
     return action === undefined ? undefined : this.performVoiceFlightAction(action);
+  }
+
+  private retireInactiveFlightPresentation(): void {
+    const camera = this.camera?.snapshot();
+    if (this.busyValue || this.groundDolly?.snapshot().active === true ||
+      this.closeupSequence?.snapshot().active === true || this.captureMedia?.hasPending('video') === true ||
+      this.nativeTasks.activeOrUnknown() || camera?.operationActive === true || camera?.recordingRequested === true) return;
+    // Retire only the old workflow card. Local clips remain the movie job's sources.
+    this.groundDolly?.retireInactive();
   }
 
   async initializeCloudVlm(): Promise<void> {
@@ -1310,29 +1476,75 @@ export class AppController {
       this.log(`云端意图阶段=${observation.purpose ?? '普通动作'}，地面停桨=${grounded}，` +
         `空中=${observation.context.airborne}，飞行状态新鲜=${observation.context.flightStateFresh}，候选=${observation.frame?.candidates.length ?? 0}`);
       const response = await this.requestCloudAgentAction(observation, description);
-      if (this.groundDolly.snapshot().active &&
+      if (isSelfSubjectRequest(description) && response.command !== undefined &&
+        ['photo', 'record_start'].includes(response.command.action)) {
+        // An explicit self target must use reference selection even if the model omits the subject flag.
+        response.command.subjectRequired = true;
+      }
+      const pendingSubject = this.groundDolly.snapshot();
+      const replacingSubject = response.command?.action === 'select_subject' &&
+        ['confirm', 'plan'].includes(pendingSubject.stage);
+      if (pendingSubject.active && !replacingSubject &&
         !['stop', 'land', 'record_stop', 'none'].includes(response.command?.action ?? '')) {
         throw new Error('拍摄流程进行中，请确认主体，或取消、降落后重试');
       }
-      if (response.command?.action === 'dolly_zoom') {
+      if (response.command !== undefined && actionNeedsSubjectSelection(response.command)) {
         this.ensureAgentObservation(observation, response.command);
         if (this.closeupSequence?.snapshot().active === true) throw new Error('飞行任务正在执行，请等待结束或先停止任务');
         this.finishAgentObservation(observation.requestId);
-        if (grounded) await this.recoverPreviousGroundedVideo(observation);
-        if (observation.requestId !== this.latestAgentRequestId) {
-          throw new Error('本次拍摄请求已被新请求替代，未开始拍摄');
-        }
-        this.ensureAgentObservation(observation, response.command);
-        const intent: AgentAction = { action: 'dolly_zoom',
-          framing: response.command.framing ?? (response.command.recipe === 'dolly_circle' ? '半身' : observation.context.framing),
-          zoom: response.command.zoom ?? (response.command.recipe === 'dolly_circle' ? 3 : observation.context.zoom),
-          retreat: response.command.retreat ?? (response.command.recipe === 'dolly_circle' ? true : observation.context.retreat),
-          recipe: response.command.recipe };
-        return await this.startGroundDolly(description, intent, observation, grounded ? 'ground' : 'hover',
-          grounded ? undefined : response.command);
+        return await this.beginSubjectTask(description, response.command, observation);
       }
       return await this.acceptAgentResponse(observation, response);
     } finally { this.finishAgentObservation(observation.requestId); }
+  }
+
+  private async beginSubjectTask(description: string, command: AgentAction,
+    observation: AgentObservation): Promise<AgentOutcome> {
+    const pending = this.groundDolly.snapshot();
+    if (pending.active) {
+      if (command.action !== 'select_subject' || !['confirm', 'plan'].includes(pending.stage) || pending.plan === undefined) {
+        throw new Error('主体任务流程进行中，请确认主体，或停止、降落后重试');
+      }
+      command = this.retargetSubjectTask(pending.plan, command);
+      this.groundDolly.cancel();
+    }
+    if (this.closeupSequence?.snapshot().active === true) throw new Error('飞行任务正在执行，请等待结束或先停止任务');
+    const state = this.session.snapshot();
+    const grounded = observation.context.flightStateFresh && !observation.context.airborne &&
+      state.telemetry.flight?.motorsOn === false;
+    if (grounded && ['photo', 'record_start', 'select_subject'].includes(command.action)) {
+      throw new Error('指定主体需要悬停扫描，请先起飞，再描述要选择的主体；本次未发送起飞请求');
+    }
+    this.ensureAgentObservation(observation, command);
+    if (grounded) await this.recoverPreviousGroundedVideo(observation);
+    if (observation.requestId !== this.latestAgentRequestId) {
+      throw new Error('本次主体任务请求已被新请求替代，未开始任务');
+    }
+    this.ensureAgentObservation(observation, command);
+    const intent: AgentAction = { action: command.action };
+    if (command.action === 'dolly_zoom') {
+      intent.framing = command.framing ?? (command.recipe === 'dolly_circle' ? '半身' : observation.context.framing);
+      intent.zoom = command.zoom ?? (command.recipe === 'dolly_circle' ? 3 : observation.context.zoom);
+      intent.retreat = command.retreat ?? (command.recipe === 'dolly_circle' ? true : observation.context.retreat);
+      if (command.recipe !== undefined) intent.recipe = command.recipe;
+    }
+    if (command.action === 'circle') intent.radiusMeters = command.radiusMeters ?? observation.context.radiusMeters;
+    return this.startGroundDolly(description, intent, observation, grounded ? 'ground' : 'hover',
+      grounded ? undefined : command);
+  }
+
+  private retargetSubjectTask(original: AgentAction, selection: AgentAction): AgentAction {
+    const command: AgentAction = { action: original.action };
+    if (selection.subjectId !== undefined) command.subjectId = selection.subjectId;
+    else if (['photo', 'record_start', 'select_subject'].includes(original.action)) command.subjectRequired = true;
+    if (original.action === 'dolly_zoom') {
+      if (original.framing !== undefined) command.framing = original.framing;
+      if (original.zoom !== undefined) command.zoom = original.zoom;
+      if (original.retreat !== undefined) command.retreat = original.retreat;
+      if (original.recipe !== undefined) command.recipe = original.recipe;
+    }
+    if (original.action === 'circle' && original.radiusMeters !== undefined) command.radiusMeters = original.radiusMeters;
+    return command;
   }
 
   private async recoverPreviousGroundedVideo(observation: AgentObservation): Promise<void> {
@@ -1386,7 +1598,7 @@ export class AppController {
     if (!flight.takeoffSent || !flight.takeoffAcknowledged || flight.movementActive || flight.landRequested || flight.landSent ||
       (telemetry.flightAgeMs ?? Infinity) > 1000 || telemetry.flight?.airborne !== true ||
       telemetry.flight.motorsOn !== true || ![6, 26].includes(telemetry.flight.modeRaw)) {
-      throw new Error('尚未确认本轮稳定悬停，未开始组合拍摄');
+      throw new Error('尚未确认本轮稳定悬停，未开始主体任务');
     }
     if ((telemetry.cameraAgeMs ?? Infinity) > 1000 || telemetry.camera?.recordingCandidate !== false || camera.recordingRequested) {
       throw new Error('相机仍在录制或状态不明确，请等待相机空闲后再拍摄');
@@ -1432,10 +1644,10 @@ export class AppController {
       if (ground.requestId !== this.latestAgentRequestId) throw new Error('本次拍摄请求已被新请求替代，未开始拍摄');
       this.ensureAgentObservation(ground, inferred ?? intent);
     }
-    this.retireCloseup();
+    if (['dolly_zoom', 'follow', 'circle', 'record_start'].includes(intent.action)) this.retireCloseup();
     this.log(`拍摄准备入口=${entry === 'hover' ? '空中悬停' : '地面起飞'}，` +
-      `方案=${intent.recipe ?? 'dolly_zoom'}，视觉目标=${inferred?.subjectId ?? '待选'}`);
-    this.agentVideoResultReady = false;
+      `方案=${intent.recipe ?? intent.action}，视觉目标=${inferred?.subjectId ?? '待选'}`);
+    if (['dolly_zoom', 'follow', 'circle', 'record_start'].includes(intent.action)) this.agentVideoResultReady = false;
     const sessionId = ground.sessionId;
     const controlGeneration = ground.controlGeneration;
     let flightGeneration = ground.flightGeneration;
@@ -1447,7 +1659,7 @@ export class AppController {
         this.session.isReliableLinkFresh() && (!tookOff || (!flight.landRequested && !flight.landSent));
     };
     const check = (): void => { if (!isCurrent()) throw new Error('拍摄流程已取消或飞机状态已变化'); };
-    const port: GroundDollyPort = {
+    const port: SubjectTaskPort = {
       isCurrent: isCurrent,
       takeoff: async (): Promise<void> => {
         check();
@@ -1498,21 +1710,21 @@ export class AppController {
             throw new Error('没有可用的主体画面，未开始拍摄');
           }
           let selected: AgentAction;
-          if (entry === 'hover' && inferred?.subjectId !== undefined) {
+          if (entry === 'hover' && inferred?.subjectId !== undefined && !isSelfSubjectRequest(text)) {
             // The first airborne inference already saw an image. Recheck its lifetime
             // and candidate against the fresh frame instead of asking the model twice.
             this.ensureAgentObservation(ground, inferred);
-            selected = { action: 'dolly_zoom', subjectId: inferred.subjectId };
+            selected = { action: 'select_subject', subjectId: inferred.subjectId };
             this.log(`复用本次云端选人结果并核对新画面：主体 #${inferred.subjectId}`);
           } else {
-            observation.purpose = 'dolly_subject';
+            observation.purpose = 'subject_selection';
             const response = await this.requestCloudAgentAction(observation, text);
             selected = response.command as AgentAction;
           }
           check();
           if (entry === 'hover') this.ensureDollyHoverReady();
           this.ensureAgentObservation(observation, selected);
-          if (selected.action !== 'dolly_zoom' || selected.subjectId === undefined) return selected;
+          if (selected.action !== 'select_subject' || selected.subjectId === undefined) return selected;
           const subject = this.session.snapshot().telemetry.subject;
           if (entry !== 'hover' || observation.frame.currentSubjectId !== selected.subjectId ||
             trackedSubjectId(subject) !== selected.subjectId) {
@@ -1522,15 +1734,20 @@ export class AppController {
             this.log(`主体 #${selected.subjectId} 仍稳定锁定，免重复发送选人指令`);
           }
           check();
-          return { action: 'dolly_zoom', subjectId: selected.subjectId, framing: settings.framing,
-            zoom: settings.zoom, retreat: settings.retreat, recipe: settings.recipe };
+          return { action: 'select_subject', subjectId: selected.subjectId };
         } finally { this.finishAgentObservation(observation.requestId); }
       },
       shoot: async (command: AgentAction): Promise<AgentOutcome> => {
         check();
-        const observation = await this.captureAgentObservation();
+        const beforePreview = this.video.snapshot();
+        const observation = await this.captureAgentObservation(true, command.subjectId);
         try {
           check();
+          const afterPreview = this.video.snapshot();
+          if (afterPreview.state !== 'live' || afterPreview.stats?.waitingForKey === true ||
+            afterPreview.stats?.decoderEpoch !== beforePreview.stats?.decoderEpoch) {
+            throw new Error('实时画面在主体确认后发生变化，请重新确认主体');
+          }
           if (entry === 'hover') this.ensureDollyHoverReady();
           const subject = this.session.snapshot().telemetry.subject;
           const trackingAge = Date.now() - (subject?.trackingAt ?? 0);
@@ -1551,8 +1768,22 @@ export class AppController {
     }
   }
 
-  async confirmGroundDolly(): Promise<AgentOutcome> { return this.groundDolly.confirm(); }
-  async executeGroundDolly(): Promise<AgentOutcome> { return this.groundDolly.execute(); }
+  async confirmSubjectTask(): Promise<AgentOutcome> {
+    try { return await this.groundDolly.confirm(); }
+    catch (error) {
+      this.agentFeedback = asError(error).message;
+      this.log(`主体任务确认失败：${this.agentFeedback}`); this.emit(); throw asError(error);
+    }
+  }
+  async executeSubjectPlan(): Promise<AgentOutcome> {
+    try { return await this.groundDolly.execute(); }
+    catch (error) {
+      this.agentFeedback = asError(error).message;
+      this.log(`主体任务执行失败：${this.agentFeedback}`); this.emit(); throw asError(error);
+    }
+  }
+  async confirmGroundDolly(): Promise<AgentOutcome> { return this.confirmSubjectTask(); }
+  async executeGroundDolly(): Promise<AgentOutcome> { return this.executeSubjectPlan(); }
 
   private async runCloseupSequence(first: AgentObservation, command: AgentAction): Promise<AgentOutcome> {
     const target = command.subjectId;
@@ -1724,11 +1955,24 @@ export class AppController {
   }
 
   private async waitForCloseupTarget(isCurrent: () => boolean, target: number): Promise<AgentObservation> {
-    const deadline = Date.now() + 8000;
+    const startedAt = Date.now();
+    let deadline = startedAt + 8000;
+    let recoveringPicture = false;
+    const freshStream = (preview: VideoPreviewSnapshot): boolean => preview.stats.running &&
+      !preview.stats.recoveryPaused && preview.stats.lastAssembledAgeMs >= 0 &&
+      preview.stats.lastAssembledAgeMs <= 1000;
+    const sameHover = (state: DroneSessionSnapshot): boolean => {
+      const telemetry = state.telemetry; const subject = telemetry.subject;
+      const age = Date.now() - (subject?.trackingAt ?? 0);
+      return trackedSubjectId(subject) === target && age >= 0 && age <= 500 &&
+        (telemetry.flightAgeMs ?? Infinity) <= 1000 && telemetry.flight?.modeRaw === 26 &&
+        telemetry.flight.airborne === true && telemetry.flight.motorsOn === true;
+    };
     this.log(`组合交接：等待原主体 #${target} 恢复新鲜跟踪，不下载录像`);
     while (Date.now() < deadline) {
       if (!isCurrent()) throw new Error('特写组合拍摄已取消或飞机状态已变化');
-      const telemetry = this.session.snapshot().telemetry;
+      const state = this.session.snapshot();
+      const telemetry = state.telemetry;
       const subject = telemetry.subject;
       const tracked = trackedSubjectId(subject);
       const age = Date.now() - (subject?.trackingAt ?? 0);
@@ -1736,22 +1980,51 @@ export class AppController {
         this.log(`组合交接拒绝：目标=${target}，当前跟踪=${tracked}，跟踪年龄=${age}ms`);
         throw new Error('原主体跟踪已明确变为其他人，未启动环绕');
       }
-      if (tracked === target && age >= 0 && age <= 500 &&
-        (telemetry.flightAgeMs ?? Infinity) <= 1000 && telemetry.flight?.modeRaw === 26) {
-        const fresh = await this.captureAgentObservation();
+      const sameTargetHover = sameHover(state);
+      const preview = this.video.snapshot();
+      const recoveringDecoder = state.phase === 'ready' && freshStream(preview) &&
+        preview.stats.lastResetReason === 'decode-stall';
+      if (sameTargetHover && recoveringDecoder && preview.stats.waitingForKey && !recoveringPicture) {
+        // A decoder-local reset may need the next aircraft IRAP. Remain in the
+        // same verified hover; this extends no movement authorization or frame TTL.
+        recoveringPicture = true; deadline = startedAt + 30000;
+        this.agentFeedback = '小艺正在恢复实时画面，确认原主体后继续环绕';
+        this.log('组合交接：同主体悬停和图传仍新鲜，限时等待解码关键帧恢复');
+        this.emit();
+      }
+      if (recoveringPicture && (!sameTargetHover || !freshStream(preview) ||
+        (preview.state !== 'live' && !recoveringDecoder))) {
+        throw new Error('恢复实时画面期间原主体、悬停或图传状态已失效，未启动环绕');
+      }
+      if (sameTargetHover && (!recoveringPicture || preview.state === 'live')) {
+        // This handoff already owns a bounded same-target recovery loop. A
+        // temporary readback gap may retry; an explicit target change may not.
+        const fresh = await this.captureAgentObservation(true, target, true);
         let accepted = false;
         try {
           if (!isCurrent() || Date.now() >= deadline) throw new Error('组合交接已取消或等待主体恢复超时');
           const frameId = fresh.frame?.currentSubjectId;
-          const after = this.session.snapshot().telemetry.subject;
+          const afterState = this.session.snapshot();
+          const after = afterState.telemetry.subject;
           const afterId = trackedSubjectId(after); const afterAge = Date.now() - (after?.trackingAt ?? 0);
           if ((frameId !== undefined && frameId !== target) ||
             (afterId !== undefined && afterAge >= 0 && afterAge <= 1000 && afterId !== target)) {
             this.log(`组合交接拒绝：目标=${target}，画面=${frameId ?? '无'}，跟踪=${afterId ?? '无'}`);
             throw new Error('原主体跟踪或当前画面已明确变为其他人，未启动环绕');
           }
-          if (frameId === target && afterId === target && afterAge >= 0 && afterAge <= 500) {
+          const afterPreview = this.video.snapshot();
+          if (!sameHover(afterState) ||
+            ((recoveringPicture || fresh.frame !== undefined) && !freshStream(afterPreview))) {
+            throw new Error('取帧期间原主体、悬停或图传状态已失效，未启动环绕');
+          }
+          const sameDecoder = afterPreview.state === 'live' && !afterPreview.stats.waitingForKey &&
+            afterPreview.stats.decoderEpoch === preview.stats.decoderEpoch;
+          if (frameId === target && afterId === target && afterAge >= 0 && afterAge <= 500 && sameDecoder) {
             accepted = true; this.log(`组合交接：新画面与跟踪均确认原主体 #${target}`); return fresh;
+          }
+          if (!sameDecoder) {
+            this.agentFeedback = '小艺正在恢复实时画面，确认原主体后继续环绕'; this.emit();
+            this.log('组合交接：取帧期间解码器已重置或尚未恢复，丢弃本张画面并重新取帧');
           }
           this.log(`组合交接暂未匹配：目标=${target}，画面=${frameId ?? '无'}，跟踪=${afterId ?? '无'}，将重新取帧`);
         } finally { if (!accepted) this.finishAgentObservation(fresh.requestId); }
@@ -1761,6 +2034,7 @@ export class AppController {
     const last = this.session.snapshot().telemetry;
     this.log(`组合交接超时：目标=${target}，飞行模式=${last.flight?.modeRaw ?? '无'}，` +
       `跟踪=${trackedSubjectId(last.subject) ?? '无'}，跟踪时间=${last.subject?.trackingAt ?? '无'}`);
+    if (recoveringPicture) throw new Error('实时画面恢复超时，未启动环绕，已拍摄录像将保留');
     throw new Error('运镜结束后未恢复原主体的新鲜画面与跟踪，未启动环绕');
   }
 
@@ -1834,7 +2108,7 @@ export class AppController {
         return this.startAgentSubjectTask('follow', observation, command, token);
       case 'prepare_dolly':
         this.applyAgentDollySettings(command);
-        agentResult(await this.nativeTasks.prepare('dolly', this.nativeConfig, token));
+        agentResult(await this.prepareNativeTask('dolly', token));
         return { message: '本轮滑动变焦已在地面准备，可以普通起飞后选人拍摄' };
       case 'circle': {
         if (command.subjectId !== undefined) return this.startAgentSubjectTask('circle', observation, command, token, videoSequence);
@@ -1845,8 +2119,8 @@ export class AppController {
         if (this.session.snapshot().telemetry.flight?.airborne) {
           await this.handoffCompletedNativeTask(observation, token);
           await this.releaseHoverTaskTarget(observation, token);
-          agentResult(await this.nativeTasks.prepareHover('circle', this.nativeConfig, token));
-        } else agentResult(await this.nativeTasks.prepare('circle', this.nativeConfig, token));
+          agentResult(await this.prepareNativeTask('circle', token, true));
+        } else agentResult(await this.prepareNativeTask('circle', token));
         return { message: agentResult(await this.startNativeWithCapture(token)) };
       }
       case 'photo': {
@@ -1884,9 +2158,63 @@ export class AppController {
       }
       case 'move':
         if (this.nativeTasks.activeOrUnknown()) throw new Error('请先停止当前原生任务');
+        this.log(`执行语音基础运动：方向=${command.direction}，时长=${command.seconds}s；直接执行`);
+        this.agentFeedback = `小艺正在执行${agentActionLabel(command)}…`; this.emit();
         agentResult(await this.flight.move(command.direction as MovementDirection, command.seconds as number, token));
         return { message: `已完成${agentActionLabel(command)}并回中` };
+      case 'move_sequence':
+        return this.executeMovementSequence(observation, command, token);
       default: throw new Error('没有可执行的动作');
+    }
+  }
+
+  private movementSequenceBlockReason(observation: AgentObservation, token: CancellationToken): string {
+    const flight = this.flight.snapshot();
+    if (token.isCancelled() || token.generation() !== flight.generation ||
+      flight.generation !== observation.flightGeneration || this.agentGeneration !== observation.controlGeneration ||
+      this.session.sessionId() !== observation.sessionId || flight.landRequested || flight.landSent) {
+      return '连续基础运动已取消或飞机状态已变化，后续步骤未执行';
+    }
+    if (!this.session.isActionLinkFresh()) return '飞机连接或图传已不新鲜，连续基础运动已停止';
+    const telemetry = this.session.snapshot().telemetry;
+    if (!flight.takeoffAcknowledged || (telemetry.flightAgeMs ?? Infinity) > 1000 ||
+      telemetry.flight?.airborne !== true || telemetry.flight.motorsOn !== true || telemetry.flight.modeRaw !== 6) {
+      return '连续基础运动需要本轮已确认的普通空中悬停，请先起飞或停止跟踪任务';
+    }
+    if (flight.nativeTaskMayFly || this.nativeTasks.activeOrUnknown() || this.groundDolly.snapshot().active ||
+      this.closeupSequence.snapshot().active) {
+      return '请先结束当前主体或运镜任务，再执行连续基础运动';
+    }
+    return '';
+  }
+
+  private async executeMovementSequence(observation: AgentObservation, command: AgentAction,
+    token: CancellationToken): Promise<AgentOutcome> {
+    this.movementSequenceToken = token;
+    const assertCurrent = (): void => {
+      const reason = this.movementSequenceBlockReason(observation, token);
+      if (reason.length > 0) throw new Error(reason);
+    };
+    try {
+      await runMovementSequence(command.steps, {
+        assertCurrent: assertCurrent,
+        onStep: (step: MovementStep, index: number, total: number): void => {
+          this.agentFeedback = `小艺正在执行第 ${index}/${total} 步：${agentActionLabel({ action: 'move',
+            direction: step.direction, seconds: step.seconds })}`;
+          this.log(this.agentFeedback); this.emit();
+        },
+        move: async (step: MovementStep): Promise<void> => {
+          agentResult(await this.flight.move(step.direction, step.seconds, token,
+            (): boolean => this.movementSequenceBlockReason(observation, token).length === 0));
+        }
+      });
+      return { message: `已按顺序完成 ${command.steps?.length ?? 0} 步基础运动，摇杆已回中` };
+    } catch (error) {
+      this.agentFeedback = `连续基础运动已中止：${asError(error as Error).message}；后续步骤未执行`;
+      this.emit();
+      throw error as Error;
+    } finally {
+      if (this.movementSequenceToken === token) this.movementSequenceToken = undefined;
     }
   }
 
@@ -2038,7 +2366,7 @@ export class AppController {
     if (!state.flight.airborne && !state.flight.motorsOn) {
       if (command.subjectId !== undefined) throw new Error('请先起飞扫描主体，再指定拍摄目标');
       if (kind === 'dolly') this.applyAgentDollySettings(command);
-      agentResult(await this.nativeTasks.prepare(kind, this.nativeConfig, token));
+      agentResult(await this.prepareNativeTask(kind, token));
       return { message: agentResult(await this.startNativeWithCapture(token, undefined, videoSequence)) };
     }
     const candidates = observation.frame?.candidates;
@@ -2051,7 +2379,7 @@ export class AppController {
     await this.releaseHoverTaskTarget(observation, token);
     this.agentFeedback = `正在悬停准备${this.taskLabel(kind)}…`; this.emit();
     this.log(`悬停准备${this.taskLabel(kind)}，目标 #${target}，${this.nativeConfig.framing}/${this.nativeConfig.zoom}倍`);
-    agentResult(await this.nativeTasks.prepareHover(kind, this.nativeConfig, token));
+    agentResult(await this.prepareNativeTask(kind, token, true));
     this.ensureAgentPhotoSession(observation, token);
     const task = this.session.snapshot().telemetry.task;
     if (task?.modeRaw === 9 && [0, 5].includes(task.phaseRaw)) {
@@ -2063,25 +2391,63 @@ export class AppController {
     return { message: agentResult(await this.startNativeWithCapture(token, target, videoSequence)) };
   }
 
-  async captureVlmFrame(): Promise<VlmFrame> {
+  async captureVlmFrame(lockedSubjectId?: number): Promise<VlmFrame> {
     if (this.vlmFramePending) throw new Error('已有图传取帧请求正在处理');
     if (this.video.snapshot().state !== 'live') throw new Error('实时图传尚未就绪');
     const sessionId = this.session.sessionId();
-    const before = this.session.snapshot().telemetry.subject;
+    const flightGeneration = this.flight.snapshot().generation;
+    const controlGeneration = this.agentGeneration;
+    const decoderEpoch = this.video.snapshot().stats?.decoderEpoch;
+    const reports: SubjectSnapshot[] = [];
+    const check = (): void => {
+      if (this.session.sessionId() !== sessionId || this.flight.snapshot().generation !== flightGeneration ||
+        this.agentGeneration !== controlGeneration || !this.session.isReliableLinkFresh()) {
+        throw new Error('取帧期间飞机会话或控制状态已变化');
+      }
+      const preview = this.video.snapshot();
+      if (preview.state !== 'live' || preview.stats?.waitingForKey === true ||
+        preview.stats?.decoderEpoch !== decoderEpoch) throw new Error('取帧期间实时画面或解码会话已变化');
+      const subject = this.session.snapshot().telemetry.subject;
+      if (subject !== undefined) {
+        const trackingId = trackedSubjectId(subject);
+        const selectedId = subject.selectedIdCandidate;
+        const selectedChanged = selectedId !== undefined && selectedId >= 0 && selectedId <= 255 &&
+          selectedId !== lockedSubjectId;
+        if (lockedSubjectId !== undefined &&
+          ((trackingId !== undefined && trackingId !== lockedSubjectId) || selectedChanged)) {
+          throw new FrameSubjectChangedError();
+        }
+        reports.push(subject);
+        if (reports.length > 48) reports.shift();
+      }
+    };
+    check();
     this.vlmFramePending = true;
+    let ticket: number = 0;
+    let result: VlmFrame | undefined;
     try {
-      const ticket = nativeVideo.requestFrame();
+      ticket = nativeVideo.requestFrame();
       if (ticket === 0) throw new Error('图传解码器尚未就绪');
       const deadline = Date.now() + 600;
       while (Date.now() < deadline && this.session.sessionId() === sessionId && this.session.isReliableLinkFresh()) {
+        check();
         const frame = nativeVideo.takeFrame(ticket);
         if (frame === undefined) {
           await new Promise<void>((resolve: () => void) => setTimeout(resolve, 16));
           continue;
         }
+        check();
         if (frame.rgba.byteLength === 0) throw new Error('设备未提供可读取的解码帧');
-        const report = closestFrameSubjects(frame.capturedAtMs, before, this.session.snapshot().telemetry.subject);
-        if (report === undefined || report.detectionAt === undefined) throw new Error('没有时间匹配的候选回报');
+        const frameAge = Date.now() - frame.capturedAtMs;
+        if (frameAge < 0 || frameAge > 600) throw new Error('取到的实时画面已过期，请重新取帧');
+        const report = matchFrameSubjects(frame.capturedAtMs, reports, lockedSubjectId);
+        if (report === undefined) {
+          const latest = reports[reports.length - 1];
+          this.log(`主体画面匹配失败：帧时间=${frame.capturedAtMs}，目标=${lockedSubjectId ?? '候选扫描'}，` +
+            `候选/跟踪时间=${latest?.detectionAt ?? -1}/${latest?.trackingAt ?? -1}，采样报告=${reports.length}`);
+          throw new Error(lockedSubjectId === undefined ? '已取得画面，但没有时间匹配的候选回报' :
+            '已取得画面，但没有时间匹配的已确认主体跟踪回报');
+        }
         markVlmCandidates(frame.rgba, frame.width, frame.height, report.candidates);
         const pixels = await image.createPixelMap(frame.rgba, { size: { width: frame.width, height: frame.height },
           srcPixelFormat: image.PixelMapFormat.RGBA_8888, pixelFormat: image.PixelMapFormat.RGBA_8888 });
@@ -2089,15 +2455,30 @@ export class AppController {
           const packer = image.createImagePacker();
           try {
             const jpeg = await packer.packToData(pixels, { format: 'image/jpeg', quality: 85 });
-            if (this.session.sessionId() !== sessionId || !this.session.isReliableLinkFresh()) throw new Error('取帧期间飞机会话已变化');
-            return { jpeg: jpeg, width: frame.width, height: frame.height, sessionId: sessionId,
-              capturedAtMs: frame.capturedAtMs, candidatesObservedAtMs: report.detectionAt, candidates: report.candidates,
-              currentSubjectId: trackedSubjectId(report) };
+            check();
+            result = { jpeg: jpeg, width: frame.width, height: frame.height, sessionId: sessionId,
+              capturedAtMs: frame.capturedAtMs, candidatesObservedAtMs: report.observedAtMs, candidates: report.candidates,
+              currentSubjectId: report.currentSubjectId };
           } finally { await packer.release(); }
         } finally { await pixels.release(); }
+        break;
       }
-      throw new Error('实时图传取帧超时或会话已断开');
-    } finally { this.vlmFramePending = false; }
+    } finally {
+      if (ticket > 0) {
+        try { nativeVideo.cancelFrame?.(ticket); }
+        catch (error) { this.log(`图传取帧票据清理失败：${asError(error).message}`); }
+      }
+      this.vlmFramePending = false;
+    }
+    if (result === undefined) throw new Error('实时图传取帧超时或会话已断开');
+    // Both asynchronous image releases and ticket cleanup may complete after
+    // control or subject state changes. Validate only the fully cleaned result.
+    check();
+    const age = Date.now() - result.capturedAtMs;
+    if (age < 0 || age > 600) throw new Error('取到的实时画面已过期，请重新取帧');
+    this.log(`主体画面匹配：来源=${lockedSubjectId === undefined ? 'candidates' : 'tracking'}，` +
+      `目标=${result.currentSubjectId ?? '候选扫描'}，帧/回报时间=${result.capturedAtMs}/${result.candidatesObservedAtMs}`);
+    return result;
   }
 
   async takeoffForDollyDemo(): Promise<void> {
@@ -2116,7 +2497,7 @@ export class AppController {
       this.demoMessage = '正在准备变焦、录像模式和媒体目录…';
       this.emit();
       try {
-        const prepared = await this.nativeTasks.prepare('dolly', this.nativeConfig, token);
+        const prepared = await this.prepareNativeTask('dolly', token);
         if (!prepared.ok || !this.dollyPreflightCurrent(token)) {
           return this.failDollyTakeoff(prepared.error?.message ?? '准备已取消');
         }
@@ -2414,6 +2795,7 @@ export class AppController {
   }
 
   async foregroundOnlySafetyShutdown(): Promise<void> {
+    this.connectionEpoch++;
     this.captureMedia.reset();
     this.videoSessionEnabled = false;
     this.video.setSession('');
@@ -2488,7 +2870,7 @@ export class AppController {
 
   private async run<T>(name: string, operation: (token: CancellationToken) => Promise<OperationResult<T>>,
     rejectWhenBusy: boolean = true): Promise<void> {
-    if (this.busyValue && rejectWhenBusy) {
+    if ((this.busyValue || (this.connectionAttempt !== undefined && !['连接', '初始化'].includes(name))) && rejectWhenBusy) {
       this.log(`${name}: 已有操作执行中`);
       this.emit();
       return;

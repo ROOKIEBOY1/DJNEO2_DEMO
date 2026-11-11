@@ -62,6 +62,17 @@ test('changing source or cancelling while the music is being prepared cannot sta
   assert.equal(g.calls.length, 0);
 });
 
+test('subject confirmation does not invalidate an already authorized movie with unchanged complete sources', async () => {
+  const f=fixture();let finish;
+  f.c.movieFiles.prepareMusic=()=>new Promise(resolve=>{finish=resolve;});
+  const pending=f.c.composeMovie({});
+  f.c.snapshot=()=>ready({subjectTask:{active:true,stage:'confirm',plan:{action:'select_subject',subjectId:13}},
+    groundDolly:{active:true,stage:'confirm',plan:{action:'select_subject',subjectId:13}}});
+  finish('/files/titan.mp3');await pending;
+  assert.equal(f.calls.filter(call=>call[0]==='start').length,1);
+  assert.deepEqual(f.c.agentMediaUris,['a','b']);
+});
+
 test('partial task cannot export and movie save targets only verified finished movie', async () => {
   const f = fixture();
   f.c.snapshot = () => ready({ closeup: { active: false, stage: 'failed' } });

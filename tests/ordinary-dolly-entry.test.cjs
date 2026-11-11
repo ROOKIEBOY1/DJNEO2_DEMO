@@ -1,7 +1,7 @@
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const {AppController}=require('../entry/src/main/ets/core/domain/AppController.ets');
-const {GroundDollyWorkflow}=require('../entry/src/main/ets/core/domain/GroundDollyWorkflow.ets');
+const {SubjectTaskWorkflow}=require('../entry/src/main/ets/core/domain/SubjectTaskWorkflow.ets');
 const {CloseupSequence}=require('../entry/src/main/ets/core/domain/CloseupSequence.ets');
 const {CloseupMediaGroup}=require('../entry/src/main/ets/core/media/CloseupMediaGroup.ets');
 const {FlightCommandService}=require('../entry/src/main/ets/core/domain/FlightCommandService.ets');
@@ -50,7 +50,7 @@ async function fixture(options={}){
     autoScanGeneration:-1,autoScanRequestedGeneration:-1,autoScanGateLog:'',autoScanHoverSince:undefined,
     autoScanFailures:0,autoScanRetryAt:0,autoScanRunning:false,hoverScanAttempted:false,demoStage:'closed',
     nativeConfig:{radiusMeters:2,framing:'全身',zoom:2,retreat:false},defaultMovementSeconds:.5,
-    groundDolly:new GroundDollyWorkflow(()=>{}),closeupSequence:new CloseupSequence(()=>{}),
+    groundDolly:new SubjectTaskWorkflow(()=>{}),closeupSequence:new CloseupSequence(()=>{}),
     closeupMedia:new CloseupMediaGroup(),captureMedia:{hasPending:()=>false},
     camera:{snapshot:()=>({recordingRequested:flags.recording,operationActive:false}),
       stopRecording:async()=>{record('record-stop');flags.recording=false;return {ok:true,data:'stopped'};}},
@@ -69,11 +69,11 @@ async function fixture(options={}){
     record('cloud',{purpose:observation.purpose,ids:observation.frame?.candidates.map(box=>box.id),
       currentSubjectId:observation.frame?.currentSubjectId});
     let command;
-    if(observation.purpose==='dolly_subject')command={action:'dolly_zoom',subjectId:13};
+    if(observation.purpose==='subject_selection')command={action:'select_subject',subjectId:13};
     else if(options.command)command={...options.command};
     else command={action:'dolly_zoom',framing:'半身',zoom:3,retreat:true,
       ...(observation.frame?.candidates.some(box=>box.id===13)?{subjectId:13}:{})};
-    if(options.transientAfterIntent&&observation.purpose!=='dolly_subject')flags.candidateIds=[11];
+    if(options.transientAfterIntent&&observation.purpose!=='subject_selection')flags.candidateIds=[11];
     return {version:2,requestId:observation.requestId,command};
   };
   c.startAgentDolly=async(observation,command)=>{
@@ -139,7 +139,7 @@ test('an empty initial airborne frame retains ordinary dolly intent until reset 
   await withReplayClock(f,async()=>{
     const outcome=await f.c.runCloudVoiceRequest('给黑衣男生拍一段滑动变焦');
     const cloud=f.events.filter(event=>event.kind==='cloud');
-    assert.deepEqual(cloud.map(event=>event.purpose),['shoot_intent','dolly_subject']);
+    assert.deepEqual(cloud.map(event=>event.purpose),['shoot_intent','subject_selection']);
     assert.deepEqual(cloud[0].ids,[],'intent classification must see the initial empty frame without waiting for scanning');
     assert.equal(outcome.confirmationRequired,true);assert.equal(f.c.groundDolly.snapshot().stage,'confirm');
     assert.equal(f.c.groundDolly.snapshot().subjectId,13);
@@ -184,7 +184,7 @@ test('ordinary ground dolly takes off once, confirms its subject and executes wi
   await withReplayClock(f,async()=>{
     const outcome=await f.c.runCloudVoiceRequest('给黑衣男生拍三倍半身希区柯克运镜');
     assert.equal(outcome.confirmationRequired,true);assert.equal(f.c.groundDolly.snapshot().stage,'confirm');
-    assert.deepEqual(f.events.filter(event=>event.kind==='cloud').map(event=>event.purpose),['ground_dolly_intent','dolly_subject']);
+    assert.deepEqual(f.events.filter(event=>event.kind==='cloud').map(event=>event.purpose),['ground_dolly_intent','subject_selection']);
     assert.equal(f.events.find(event=>event.kind==='cloud').ids,undefined);
     assert.deepEqual(f.events.filter(event=>event.kind==='flight').map(event=>event.action),[1]);
     assert.deepEqual(f.events.filter(event=>event.kind==='selection').map(event=>event.id),[13]);
@@ -237,7 +237,7 @@ test('a temporarily unavailable intent frame falls back to fresh visual selectio
   assert.equal(outcome.confirmationRequired,true);
   assert.equal(c.groundDolly.snapshot().stage,'confirm');assert.equal(c.groundDolly.snapshot().subjectId,13);
   const cloud=events.filter(event=>event.kind==='cloud');
-  assert.deepEqual(cloud.map(event=>event.purpose),['shoot_intent','dolly_subject']);
+  assert.deepEqual(cloud.map(event=>event.purpose),['shoot_intent','subject_selection']);
   assert.equal(cloud[0].ids,undefined);assert.deepEqual(cloud[1].ids,[11,13]);
   assert.equal(cloud[1].currentSubjectId,13);assert.equal(c.selectedSubjectId,13);
   assert.equal(events.some(event=>['selection','dolly','closeup','flight'].includes(event.kind)),false);

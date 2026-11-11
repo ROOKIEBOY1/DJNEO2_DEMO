@@ -95,9 +95,11 @@ struct Index {
   }
 
   private connectionLabel(): string {
-    if (this.state.session.phase === 'ready') return '已连接';
+    if (this.state.connectionRecovering) return '正在准备连接';
+    if (this.state.connectionReady) return this.state.connectionFrameReady ? '已连接' : '已连接 · 等待画面';
+    if (this.state.session.phase === 'ready') return '连接待恢复 · 点此重试';
     if (this.state.session.phase === 'disconnected' || this.state.session.phase === 'failed') return '未连接 · 点此重试';
-    if (this.state.session.phase === 'registering') return '正在初始化';
+    if (this.state.session.phase === 'registering') return this.state.busy ? '正在初始化' : '初始化未完成 · 点此重试';
     return '正在连接';
   }
 

@@ -115,3 +115,47 @@ test('takeoff failure prevents scan and duplicate execution while shooting does 
   const first=flow.execute();await assert.rejects(flow.execute());done();await first;
   assert.equal(calls.filter(x=>x==='shoot').length,1);
 });
+
+test('cancelling an inactive shooting workflow retires its old progress without starting another action',async()=>{
+  const {flow,host,calls}=fixture();
+  await flow.start('拍运镜',{action:'dolly_zoom'},host);await flow.confirm();await flow.execute();
+  flow.cancel();
+  assert.equal(flow.snapshot().stage,'idle');assert.equal(flow.snapshot().active,false);
+  assert.equal(flow.snapshot().plan,undefined);assert.equal(flow.snapshot().message,'');
+  assert.equal(calls.length,4);
+});
+
+test('inactive presentation can be retired while active subject confirmation and execution stay intact',async()=>{
+  const {flow,host}=fixture();
+  await flow.start('拍运镜',{action:'dolly_zoom'},host);await flow.confirm();
+  assert.equal(flow.retireInactive(),false);assert.equal(flow.snapshot().stage,'plan');
+  await flow.execute();
+  assert.equal(flow.retireInactive(),true);assert.equal(flow.snapshot().stage,'idle');
+  assert.equal(flow.snapshot().plan,undefined);
+});
+
+test('legacy visual selection cannot overwrite explicit frozen dolly parameters or inject a recipe',async()=>{
+  const intent={action:'dolly_zoom',framing:'全身',zoom:2,retreat:false};
+  const selected={action:'dolly_zoom',subjectId:13,framing:'半身',zoom:3,retreat:true,recipe:'dolly_circle'};
+  let executed;
+  const {flow,host}=fixture({select:async()=>selected,shoot:async command=>{executed=command;return {message:'启动'};}});
+  await flow.start('全身两倍关闭渐远',intent,host,'hover');
+  intent.zoom=3;intent.recipe='dolly_circle';
+  await flow.confirm();
+  assert.deepEqual(flow.snapshot().plan,{action:'dolly_zoom',subjectId:13,framing:'全身',zoom:2,retreat:false});
+  await flow.execute();
+  assert.deepEqual(executed,{action:'dolly_zoom',subjectId:13,framing:'全身',zoom:2,retreat:false});
+});
+
+test('legacy selection cannot remove frozen parameters or a recipe omitted from its reply',async()=>{
+  const {flow,host}=fixture({select:async()=>({action:'dolly_zoom',subjectId:13})});
+  await flow.start('拍特写组合',{action:'dolly_zoom',framing:'半身',zoom:3,retreat:true,recipe:'dolly_circle'},host,'hover');
+  await flow.confirm();
+  assert.deepEqual(flow.snapshot().plan,{action:'dolly_zoom',subjectId:13,framing:'半身',zoom:3,retreat:true,recipe:'dolly_circle'});
+});
+
+test('legacy bare dolly selection may fill missing shooting defaults but cannot add a new recipe',async()=>{
+  const {flow,host}=fixture({select:async()=>({action:'dolly_zoom',subjectId:13,framing:'半身',zoom:3,retreat:false,recipe:'dolly_circle'})});
+  await flow.start('拍运镜',{action:'dolly_zoom'},host,'hover');await flow.confirm();
+  assert.deepEqual(flow.snapshot().plan,{action:'dolly_zoom',subjectId:13,framing:'半身',zoom:3,retreat:false});
+});

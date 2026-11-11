@@ -33,7 +33,7 @@ test('source groups deduplicate in source order and snapshots cannot mutate the 
   assert.deepEqual(f.calls.starts[0].sources, ['/clips/b.mp4', '/clips/a.mp4']);
   assert.deepEqual(f.composer.snapshot().sources, ['/clips/b.mp4', '/clips/a.mp4']);
   assert.equal(f.composer.snapshot().stage, 'probing');
-  assert.match(snapshot.sourceKey, /titan-v1/);
+  assert.match(snapshot.sourceKey, /^user-bgm-v5\|/);
 });
 
 test('source identity changes with order or capture revision but not duplicate entries', () => {
