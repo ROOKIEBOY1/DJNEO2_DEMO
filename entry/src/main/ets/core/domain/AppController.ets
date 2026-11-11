@@ -27,7 +27,7 @@ import { Context } from '@kit.AbilityKit';
 import { LocalSpeechRecognizer } from '../platform/LocalSpeechRecognizer';
 import { AircraftProfileStore, AircraftProfileSummary } from '../profile/AircraftProfileStore';
 import { NeoWifiLink } from '../platform/NeoWifiLink';
-import { SubjectBox, SubjectSnapshot, selectedSubjectOverlay } from './SubjectObservation';
+import { SubjectBox, selectedSubjectOverlay } from './SubjectObservation';
 import { SubjectTaskWorkflow, SubjectTaskSnapshot, SubjectTaskPort } from './SubjectTaskWorkflow';
 import { normalizeDroneUtterance } from './VoiceUtterance';
 import { CloseupSequence, CloseupSequenceSnapshot, CloseupSequencePort } from './CloseupSequence';
@@ -38,8 +38,7 @@ import { MovieComposer, MovieCompositionSnapshot } from '../media/MovieComposer'
 import { movieMediaReady, movieSourceReady } from '../media/MovieEligibility';
 import { NativeMovieFiles, nativeMoviePort } from '../platform/NativeMovieExport';
 import { image } from '@kit.ImageKit';
-import { canApplyVlmSelection, FrameSubjectChangedError, matchFrameSubjects, markVlmCandidates,
-  trackedSubjectId, VlmFrame } from '../media/VlmFrame';
+import { canApplyVlmSelection, closestFrameSubjects, markVlmCandidates, trackedSubjectId, VlmFrame } from '../media/VlmFrame';
 import { AgentAction, AgentObservation, AgentOutcome, AgentResponse, DirectFlightAction, parseDirectFlightVoice, parseDirectStopVoice, agentActionLabel, agentNeedsConfirmation,
   actionNeedsSubjectSelection, agentObservationTimeoutMs, validateAgentAction, validateAgentResponse } from './AgentAction';
 
@@ -56,7 +55,6 @@ export interface ConsoleSnapshot {
   selectedAircraftId: string;
   wifiProgress: string;
   connectionReady: boolean;
-  connectionFrameReady: boolean;
   connectionRecovering: boolean;
   session: DroneSessionSnapshot;
   flight: FlightCommandSnapshot;
@@ -195,13 +193,6 @@ export class AppController {
 
   constructor(filesDirectory: string, context: Context) {
     this.outputDirectory = filesDirectory;
-    try {
-      if (typeof nativeVideo.setDiagnosticDirectory === 'function') {
-        const directory = `${filesDirectory}/video-diagnostics`;
-        if (!fileIo.accessSync(directory)) fileIo.mkdirSync(directory);
-        nativeVideo.setDiagnosticDirectory(directory);
-      }
-    } catch (error) { this.log(`视频诊断目录未启用：${asError(error).message}`); }
     this.cloudVlm = new CloudVlmClient(this.cloudKeys, new SelfReferencePhotoStore(context));
     this.profiles = new AircraftProfileStore(filesDirectory);
     this.session = new DroneSession();
@@ -289,7 +280,6 @@ export class AppController {
       selectedAircraftId: this.profiles.selectedId(),
       wifiProgress: this.wifiProgressValue,
       connectionReady: this.connectionControlReady(),
-      connectionFrameReady: this.previewReady(),
       connectionRecovering: this.connectionAttempt !== undefined,
       session: session,
       flight: this.flight.snapshot(),
@@ -1171,8 +1161,7 @@ export class AppController {
     this.emit();
   }
 
-  async captureAgentObservation(waitForScan: boolean = true, lockedSubjectId?: number,
-    allowMissingFrame: boolean = false): Promise<AgentObservation> {
+  async captureAgentObservation(waitForScan: boolean = true): Promise<AgentObservation> {
     const sessionId = this.session.sessionId();
     const generation = this.flight.snapshot().generation;
     const controlGeneration = this.agentGeneration;
@@ -1180,17 +1169,8 @@ export class AppController {
     if (waitForScan) await this.waitForAutomaticSubjectScan();
     let frame: VlmFrame | undefined;
     if (this.video.snapshot().state === 'live') {
-      try { frame = await this.captureVlmFrame(lockedSubjectId); }
-      catch (error) {
-        this.log(`动作请求未附图像：${asError(error).message}`);
-        if (error instanceof FrameSubjectChangedError) throw error;
-        if (lockedSubjectId !== undefined && !allowMissingFrame) {
-          throw new Error(`未能复核已确认主体：${asError(error).message}；未启动运镜`);
-        }
-      }
-    }
-    if (lockedSubjectId !== undefined && frame === undefined && !allowMissingFrame) {
-      throw new Error('实时画面尚未就绪，未能复核已确认主体；未启动运镜');
+      try { frame = await this.captureVlmFrame(); }
+      catch (error) { this.log(`动作请求未附图像：${asError(error).message}`); }
     }
     if (sessionId !== this.session.sessionId() || generation !== this.flight.snapshot().generation ||
       controlGeneration !== this.agentGeneration || !this.session.isReliableLinkFresh()) {
@@ -1740,7 +1720,7 @@ export class AppController {
       shoot: async (command: AgentAction): Promise<AgentOutcome> => {
         check();
         const beforePreview = this.video.snapshot();
-        const observation = await this.captureAgentObservation(true, command.subjectId);
+        const observation = await this.captureAgentObservation();
         try {
           check();
           const afterPreview = this.video.snapshot();
@@ -1775,13 +1755,7 @@ export class AppController {
       this.log(`主体任务确认失败：${this.agentFeedback}`); this.emit(); throw asError(error);
     }
   }
-  async executeSubjectPlan(): Promise<AgentOutcome> {
-    try { return await this.groundDolly.execute(); }
-    catch (error) {
-      this.agentFeedback = asError(error).message;
-      this.log(`主体任务执行失败：${this.agentFeedback}`); this.emit(); throw asError(error);
-    }
-  }
+  async executeSubjectPlan(): Promise<AgentOutcome> { return this.groundDolly.execute(); }
   async confirmGroundDolly(): Promise<AgentOutcome> { return this.confirmSubjectTask(); }
   async executeGroundDolly(): Promise<AgentOutcome> { return this.executeSubjectPlan(); }
 
@@ -1997,9 +1971,7 @@ export class AppController {
         throw new Error('恢复实时画面期间原主体、悬停或图传状态已失效，未启动环绕');
       }
       if (sameTargetHover && (!recoveringPicture || preview.state === 'live')) {
-        // This handoff already owns a bounded same-target recovery loop. A
-        // temporary readback gap may retry; an explicit target change may not.
-        const fresh = await this.captureAgentObservation(true, target, true);
+        const fresh = await this.captureAgentObservation();
         let accepted = false;
         try {
           if (!isCurrent() || Date.now() >= deadline) throw new Error('组合交接已取消或等待主体恢复超时');
@@ -2391,63 +2363,25 @@ export class AppController {
     return { message: agentResult(await this.startNativeWithCapture(token, target, videoSequence)) };
   }
 
-  async captureVlmFrame(lockedSubjectId?: number): Promise<VlmFrame> {
+  async captureVlmFrame(): Promise<VlmFrame> {
     if (this.vlmFramePending) throw new Error('已有图传取帧请求正在处理');
     if (this.video.snapshot().state !== 'live') throw new Error('实时图传尚未就绪');
     const sessionId = this.session.sessionId();
-    const flightGeneration = this.flight.snapshot().generation;
-    const controlGeneration = this.agentGeneration;
-    const decoderEpoch = this.video.snapshot().stats?.decoderEpoch;
-    const reports: SubjectSnapshot[] = [];
-    const check = (): void => {
-      if (this.session.sessionId() !== sessionId || this.flight.snapshot().generation !== flightGeneration ||
-        this.agentGeneration !== controlGeneration || !this.session.isReliableLinkFresh()) {
-        throw new Error('取帧期间飞机会话或控制状态已变化');
-      }
-      const preview = this.video.snapshot();
-      if (preview.state !== 'live' || preview.stats?.waitingForKey === true ||
-        preview.stats?.decoderEpoch !== decoderEpoch) throw new Error('取帧期间实时画面或解码会话已变化');
-      const subject = this.session.snapshot().telemetry.subject;
-      if (subject !== undefined) {
-        const trackingId = trackedSubjectId(subject);
-        const selectedId = subject.selectedIdCandidate;
-        const selectedChanged = selectedId !== undefined && selectedId >= 0 && selectedId <= 255 &&
-          selectedId !== lockedSubjectId;
-        if (lockedSubjectId !== undefined &&
-          ((trackingId !== undefined && trackingId !== lockedSubjectId) || selectedChanged)) {
-          throw new FrameSubjectChangedError();
-        }
-        reports.push(subject);
-        if (reports.length > 48) reports.shift();
-      }
-    };
-    check();
+    const before = this.session.snapshot().telemetry.subject;
     this.vlmFramePending = true;
-    let ticket: number = 0;
-    let result: VlmFrame | undefined;
     try {
-      ticket = nativeVideo.requestFrame();
+      const ticket = nativeVideo.requestFrame();
       if (ticket === 0) throw new Error('图传解码器尚未就绪');
       const deadline = Date.now() + 600;
       while (Date.now() < deadline && this.session.sessionId() === sessionId && this.session.isReliableLinkFresh()) {
-        check();
         const frame = nativeVideo.takeFrame(ticket);
         if (frame === undefined) {
           await new Promise<void>((resolve: () => void) => setTimeout(resolve, 16));
           continue;
         }
-        check();
         if (frame.rgba.byteLength === 0) throw new Error('设备未提供可读取的解码帧');
-        const frameAge = Date.now() - frame.capturedAtMs;
-        if (frameAge < 0 || frameAge > 600) throw new Error('取到的实时画面已过期，请重新取帧');
-        const report = matchFrameSubjects(frame.capturedAtMs, reports, lockedSubjectId);
-        if (report === undefined) {
-          const latest = reports[reports.length - 1];
-          this.log(`主体画面匹配失败：帧时间=${frame.capturedAtMs}，目标=${lockedSubjectId ?? '候选扫描'}，` +
-            `候选/跟踪时间=${latest?.detectionAt ?? -1}/${latest?.trackingAt ?? -1}，采样报告=${reports.length}`);
-          throw new Error(lockedSubjectId === undefined ? '已取得画面，但没有时间匹配的候选回报' :
-            '已取得画面，但没有时间匹配的已确认主体跟踪回报');
-        }
+        const report = closestFrameSubjects(frame.capturedAtMs, before, this.session.snapshot().telemetry.subject);
+        if (report === undefined || report.detectionAt === undefined) throw new Error('没有时间匹配的候选回报');
         markVlmCandidates(frame.rgba, frame.width, frame.height, report.candidates);
         const pixels = await image.createPixelMap(frame.rgba, { size: { width: frame.width, height: frame.height },
           srcPixelFormat: image.PixelMapFormat.RGBA_8888, pixelFormat: image.PixelMapFormat.RGBA_8888 });
@@ -2455,30 +2389,15 @@ export class AppController {
           const packer = image.createImagePacker();
           try {
             const jpeg = await packer.packToData(pixels, { format: 'image/jpeg', quality: 85 });
-            check();
-            result = { jpeg: jpeg, width: frame.width, height: frame.height, sessionId: sessionId,
-              capturedAtMs: frame.capturedAtMs, candidatesObservedAtMs: report.observedAtMs, candidates: report.candidates,
-              currentSubjectId: report.currentSubjectId };
+            if (this.session.sessionId() !== sessionId || !this.session.isReliableLinkFresh()) throw new Error('取帧期间飞机会话已变化');
+            return { jpeg: jpeg, width: frame.width, height: frame.height, sessionId: sessionId,
+              capturedAtMs: frame.capturedAtMs, candidatesObservedAtMs: report.detectionAt, candidates: report.candidates,
+              currentSubjectId: trackedSubjectId(report) };
           } finally { await packer.release(); }
         } finally { await pixels.release(); }
-        break;
       }
-    } finally {
-      if (ticket > 0) {
-        try { nativeVideo.cancelFrame?.(ticket); }
-        catch (error) { this.log(`图传取帧票据清理失败：${asError(error).message}`); }
-      }
-      this.vlmFramePending = false;
-    }
-    if (result === undefined) throw new Error('实时图传取帧超时或会话已断开');
-    // Both asynchronous image releases and ticket cleanup may complete after
-    // control or subject state changes. Validate only the fully cleaned result.
-    check();
-    const age = Date.now() - result.capturedAtMs;
-    if (age < 0 || age > 600) throw new Error('取到的实时画面已过期，请重新取帧');
-    this.log(`主体画面匹配：来源=${lockedSubjectId === undefined ? 'candidates' : 'tracking'}，` +
-      `目标=${result.currentSubjectId ?? '候选扫描'}，帧/回报时间=${result.capturedAtMs}/${result.candidatesObservedAtMs}`);
-    return result;
+      throw new Error('实时图传取帧超时或会话已断开');
+    } finally { this.vlmFramePending = false; }
   }
 
   async takeoffForDollyDemo(): Promise<void> {

@@ -2,8 +2,6 @@
 #include "HevcStream.h"
 #include "VideoRecovery.h"
 #include "VideoParameterCache.h"
-#include "VideoDiagnosticGop.h"
-#include "VideoDiagnosticPublish.h"
 #include "MovieExport.h"
 #include <napi/native_api.h>
 #include <multimedia/player_framework/native_avcodec_videodecoder.h>
@@ -16,16 +14,10 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
-#include <cerrno>
-#include <cstdio>
-#include <fstream>
 #include <limits>
 #include <mutex>
 #include <memory>
 #include <string>
-#include <sstream>
-#include <stdexcept>
-#include <sys/stat.h>
 #include <thread>
 
 namespace {
@@ -51,36 +43,6 @@ void ReadbackStage(uint32_t ticket, const char *stage, int code = 0) {
     OH_LOG_Print(LOG_APP, LOG_INFO, 0, "NeoReadback",
         "ticket=%{public}u stage=%{public}s code=%{public}d", ticket, stage, code);
 }
-std::string Hex(const neo::Bytes &bytes) {
-    static constexpr char digits[] = "0123456789abcdef";
-    std::string result;
-    result.reserve(bytes.size() * 2);
-    for (auto byte : bytes) { result += digits[byte >> 4]; result += digits[byte & 15]; }
-    return result;
-}
-struct DiagnosticFileSink {
-    std::string rawPath, manifestPath, rawTemporary, metadataTemporary;
-    const neo::Bytes &raw;
-    const std::string &metadata;
-    DiagnosticFileSink(const std::string &stem, const neo::Bytes &bytes, const std::string &json)
-        : rawPath(stem + ".h265"), manifestPath(stem + ".json"), rawTemporary(stem + ".h265.tmp"),
-          metadataTemporary(stem + ".json.tmp"), raw(bytes), metadata(json) {}
-    static bool Remove(const std::string &path) {
-        return std::remove(path.c_str()) == 0 || errno == ENOENT;
-    }
-    static bool Write(const std::string &path, const char *data, size_t size) {
-        std::ofstream output(path, std::ios::binary | std::ios::trunc);
-        output.write(data, static_cast<std::streamsize>(size)); output.close();
-        return static_cast<bool>(output);
-    }
-    bool InvalidateManifest() { return Remove(manifestPath); }
-    bool WriteRawTemporary() { return Write(rawTemporary, reinterpret_cast<const char *>(raw.data()), raw.size()); }
-    bool WriteMetadataTemporary() { return Write(metadataTemporary, metadata.data(), metadata.size()); }
-    bool PublishRaw() { return std::rename(rawTemporary.c_str(), rawPath.c_str()) == 0; }
-    bool RemoveRaw() { return Remove(rawPath); }
-    bool PublishManifest() { return std::rename(metadataTemporary.c_str(), manifestPath.c_str()) == 0; }
-    void CleanupTemporary() { std::remove(rawTemporary.c_str()); std::remove(metadataTemporary.c_str()); }
-};
 
 // Keep reference pictures across requests. Only convert an output when asked.
 class FrameDecoder {
@@ -111,10 +73,6 @@ public:
 
     CapturedFrame Pump(uint32_t ticket) {
         CapturedFrame sample;
-        if (ticket != lastTicket_) {
-            lastTicket_ = ticket;
-            if (ticket) LogState("request", ticket);
-        }
         auto *codec = codec_.get();
         if (!codec) return sample;
         for (int i = 0; i < 8; ++i) {
@@ -123,14 +81,12 @@ public:
             if (code == AV_ERR_TRY_AGAIN_LATER) break;
             if (code == AV_ERR_STREAM_CHANGED) { ReadLayout(); continue; }
             if (code != AV_ERR_OK) { Fail("output-query", code); return {}; }
-            ++outputs_; lastOutputAt_ = Now();
             if (ticket != 0) {
                 if (stride_ == 0) ReadLayout();
                 auto frame = Capture(OH_VideoDecoder_GetOutputBuffer(codec, index), ticket);
                 if (!frame.pixels.empty() && frame.at >= sample.at) sample = std::move(frame);
             }
-            const auto released = OH_VideoDecoder_FreeOutputBuffer(codec, index);
-            if (released != AV_ERR_OK) { Fail("output-release", released); return {}; }
+            OH_VideoDecoder_FreeOutputBuffer(codec, index);
         }
         while (!queue_.empty()) {
             uint32_t index = 0;
@@ -150,26 +106,9 @@ public:
             code = OH_AVBuffer_SetBufferAttr(buffer, &attr);
             if (code == AV_ERR_OK) code = OH_VideoDecoder_PushInputBuffer(codec, index);
             if (code != AV_ERR_OK) { Fail("input-submit", code); return {}; }
-            ++inputs_;
             queue_.pop_front();
         }
         return sample;
-    }
-
-    std::string Diagnostics() const {
-        std::ostringstream text;
-        text << "{\"starts\":" << starts_ << ",\"submitted\":" << inputs_
-             << ",\"outputs\":" << outputs_ << ",\"queue\":" << queue_.size()
-             << ",\"ageRejected\":" << ageRejected_ << ",\"metadataRejected\":" << metadataRejected_
-             << ",\"nonPictureOutputs\":" << nonPictureOutputs_
-             << ",\"layoutRejected\":" << layoutRejected_ << ",\"apiErrors\":" << apiErrors_
-             << ",\"lastOutputAgeMs\":" << (lastOutputAt_ ? Now() - lastOutputAt_ : -1) << "}";
-        return text.str();
-    }
-    void LogState(const char *event, uint32_t ticket = 0) const {
-        const auto diagnostics = Diagnostics();
-        OH_LOG_Print(LOG_APP, LOG_INFO, 0, "NeoReadback", "event=%{public}s ticket=%{public}u progress=%{public}s",
-            event, ticket, diagnostics.c_str());
     }
 
 private:
@@ -179,9 +118,7 @@ private:
             std::chrono::system_clock::now().time_since_epoch()).count();
     }
     void Fail(const char *stage, int code = 0) {
-        ++apiErrors_;
         OH_LOG_Print(LOG_APP, LOG_WARN, 0, "NeoReadback", "continuous %{public}s code=%{public}d", stage, code);
-        LogState("failure", lastTicket_);
         Reset();
     }
     bool Start(int width, int height) {
@@ -206,7 +143,6 @@ private:
         if (started != AV_ERR_OK) return false;
         width_ = width;
         height_ = height;
-        ++starts_;
         OH_LOG_Print(LOG_APP, LOG_INFO, 0, "NeoReadback", "continuous decoder started");
         return true;
     }
@@ -218,18 +154,14 @@ private:
         OH_AVFormat_GetIntValue(format, OH_MD_KEY_PIXEL_FORMAT, &pixelFormat_);
         OH_AVFormat_Destroy(format);
     }
-    CapturedFrame Capture(OH_AVBuffer *buffer, uint32_t ticket) {
+    CapturedFrame Capture(OH_AVBuffer *buffer, uint32_t ticket) const {
         CapturedFrame sample;
         sample.ticket = ticket;
         OH_AVCodecBufferAttr attr{};
-        if (!buffer || OH_AVBuffer_GetBufferAttr(buffer, &attr) != AV_ERR_OK) {
-            ++metadataRejected_; return {};
-        }
-        if (attr.flags & (AVCODEC_BUFFER_FLAGS_EOS | AVCODEC_BUFFER_FLAGS_CODEC_DATA)) {
-            ++nonPictureOutputs_; return {};
-        }
+        if (!buffer || OH_AVBuffer_GetBufferAttr(buffer, &attr) != AV_ERR_OK ||
+            (attr.flags & (AVCODEC_BUFFER_FLAGS_EOS | AVCODEC_BUFFER_FLAGS_CODEC_DATA))) return {};
         const auto age = WallMs() - attr.pts / 1000;
-        if (age < 0 || age > 180) { ++ageRejected_; return {}; }
+        if (age < 0 || age > 180) return {};
         const int width = width_, height = height_;
         const int stride = stride_, sliceHeight = sliceHeight_, pixelFormat = pixelFormat_;
         auto *data = OH_AVBuffer_GetAddr(buffer);
@@ -263,7 +195,7 @@ private:
                     sample.pixels[p + 3] = 255;
                 }
             }
-        } else ++layoutRejected_;
+        }
         return sample;
     }
 
@@ -272,10 +204,6 @@ private:
     int width_ = 0, height_ = 0;
     int32_t stride_ = 0, sliceHeight_ = 0, pixelFormat_ = 0;
     int64_t lastPts_ = 0;
-    uint64_t starts_ = 0, inputs_ = 0, outputs_ = 0, ageRejected_ = 0;
-    uint64_t metadataRejected_ = 0, nonPictureOutputs_ = 0, layoutRejected_ = 0, apiErrors_ = 0;
-    int64_t lastOutputAt_ = 0;
-    uint32_t lastTicket_ = 0;
 };
 
 // The worker is the only owner of codec APIs and NativeWindow. Callbacks just
@@ -283,20 +211,6 @@ private:
 class Preview {
 public:
     ~Preview() { Stop(); }
-    bool SetDiagnosticDirectory(std::string directory) {
-        const std::string privateRoot = "/data/storage/el2/base/haps/entry/files/";
-        if (!directory.empty() && (directory.compare(0, privateRoot.size(), privateRoot) != 0 ||
-            directory.find("..") != std::string::npos || directory.find('\0') != std::string::npos)) return false;
-        while (!directory.empty() && directory.back() == '/') directory.pop_back();
-        struct stat slots[2]{};
-        const bool exists0 = !directory.empty() && stat((directory + "/stall-0.json").c_str(), &slots[0]) == 0;
-        const bool exists1 = !directory.empty() && stat((directory + "/stall-1.json").c_str(), &slots[1]) == 0;
-        std::lock_guard<std::mutex> lock(mutex_);
-        diagnosticDirectory_ = std::move(directory);
-        diagnosticsEnabled_ = !diagnosticDirectory_.empty();
-        nextDiagnosticSlot_ = !exists0 ? 0 : !exists1 ? 1 : slots[0].st_mtime <= slots[1].st_mtime ? 0 : 1;
-        return true;
-    }
     void Start(uint64_t surface) {
         Stop();
         { std::lock_guard<std::mutex> lock(mutex_); stats_ = {}; stats_.running = true;
@@ -312,12 +226,6 @@ public:
         captured_ = {};
         captureTicket_ = captureSequence_;
         return captureTicket_;
-    }
-    void CancelFrame(uint32_t ticket) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (ticket == 0 || captureTicket_ != ticket) return;
-        captureTicket_ = 0;
-        if (captured_.ticket == ticket) captured_ = {};
     }
     CapturedFrame TakeFrame(uint32_t ticket) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -455,50 +363,6 @@ private:
         }
         return changed;
     }
-    void SaveDiagnostic(neo::VideoDiagnosticGop<neo::Bytes> &gop, const neo::Bytes &configuration,
-                        unsigned firstParameterMask, bool configurationComplete,
-                        bool recordingFailed, const FrameDecoder &readback) {
-        std::string directory;
-        Stats stats;
-        unsigned slot;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            directory = diagnosticDirectory_; stats = stats_;
-            gop.SetNextSlot(nextDiagnosticSlot_);
-            slot = gop.NextSlot(); nextDiagnosticSlot_ = slot ^ 1;
-        }
-        if (directory.empty()) return;
-        const auto stem = directory + "/stall-" + std::to_string(slot);
-        try {
-            if (mkdir(directory.c_str(), 0700) != 0 && errno != EEXIST)
-                throw std::runtime_error("create private diagnostic directory");
-            const auto &data = gop.Data();
-            std::ostringstream metadata;
-            metadata << "{\"version\":1,\"reason\":\"decode-stall\",\"slot\":" << slot
-                << ",\"complete\":" << (gop.Complete() && !recordingFailed ? "true" : "false")
-                << ",\"incompleteReason\":\"" << (recordingFailed ? "recording-failed" : gop.Overflowed() ?
-                    "memory-limit" : !gop.Started() ? "awaiting-irap" : "none") << "\""
-                << ",\"storedBytes\":" << data.size() << ",\"inputBytes\":" << gop.InputBytes()
-                << ",\"framesSinceIrap\":" << gop.Frames() << ",\"decoderEpoch\":" << stats.decoderEpoch
-                << ",\"configurationPrefixHex\":\"" << Hex(configuration) << "\""
-                << ",\"configurationPrefixComplete\":" << (configurationComplete ? "true" : "false")
-                << ",\"firstAuParameterMask\":" << firstParameterMask
-                << ",\"submittedFrames\":" << stats.submitted << ",\"decodedFrames\":" << stats.decoded
-                << ",\"renderedFrames\":" << stats.rendered << ",\"width\":" << stats.width
-                << ",\"height\":" << stats.height << ",\"capturedAtMonotonicMs\":" << Now()
-                << ",\"readback\":" << readback.Diagnostics() << "}";
-            const auto json = metadata.str();
-            DiagnosticFileSink sink(stem, data, json);
-            if (!neo::PublishVideoDiagnostic(sink, gop.Complete() && !recordingFailed))
-                throw std::runtime_error("publish diagnostic files");
-            OH_LOG_Print(LOG_APP, LOG_INFO, 0, "NeoVideo",
-                "diagnostic-saved slot=%{public}u complete=%{public}d bytes=%{public}zu epoch=%{public}llu",
-                slot, gop.Complete() && !recordingFailed, data.size(), static_cast<unsigned long long>(stats.decoderEpoch));
-        } catch (const std::exception &error) {
-            OH_LOG_Print(LOG_APP, LOG_WARN, 0, "NeoVideo", "diagnostic-write-failed %{public}s errno=%{public}d",
-                error.what(), errno);
-        }
-    }
     void Run(uint64_t surface) {
         LogState("worker-start", surface);
         if (OH_NativeWindow_CreateNativeWindowFromSurfaceId(surface, &window_) != 0 || !window_) {
@@ -511,10 +375,6 @@ private:
         // Parameters belong to this worker session, never to the reusable facade.
         neo::VideoParameterCache<neo::Bytes> parameters;
         FrameDecoder readback;
-        neo::VideoDiagnosticGop<neo::Bytes> diagnosticGop;
-        neo::Bytes diagnosticConfiguration;
-        unsigned diagnosticFirstParameterMask = 0;
-        bool diagnosticRecordingFailed = false, diagnosticConfigurationComplete = false;
         neo::VideoRecovery recovery;
         bool waitingKey = true; unsigned startupLogs = 0; int64_t startedAt = 0, lastInput = 0, lastPts = 0;
         int64_t lastStatsLog = Now();
@@ -536,7 +396,6 @@ private:
             if (scope == neo::VideoResetScope::Stream) stream.Reset();
             parameters.Reset(scope);
             readback.Reset();
-            diagnosticGop.Reset(); diagnosticConfiguration.clear();
             { std::lock_guard<std::mutex> lock(mutex_);
               // Do not drop unparsed input on a codec-only reset: it may contain
               // a real parameter change which must replace retained config.
@@ -582,7 +441,6 @@ private:
                     // Devices that cannot switch a running decoder still retain this session's VPS/SPS/PPS.
                     Destroy(); ready.clear(); outputs.clear(); waitingKey = true;
                     readback.Reset();
-                    diagnosticGop.Reset(); diagnosticConfiguration.clear();
                     restartEvidence("surface-switch-recreate");
                     { std::lock_guard<std::mutex> lock(mutex_); stats_.waitingKeyAt = Now();
                       stats_.configurationRetained = parameters.Mask() == 7; captured_ = {}; }
@@ -599,26 +457,9 @@ private:
             // discards all handles from the destroyed generation before rendering.
             for (auto &output : outputs) {
                 OH_AVCodecBufferAttr attr{};
-                if (!codec_) continue;
-                const auto metadataCode = OH_AVBuffer_GetBufferAttr(output.data, &attr);
-                if (metadataCode != AV_ERR_OK) {
-                    // The callback transferred this index even when its metadata
-                    // is unreadable. Losing the index exhausts the output pool.
-                    Fail("读取视频输出属性失败，错误码 " + std::to_string(metadataCode));
-                    const auto released = OH_VideoDecoder_FreeOutputBuffer(codec_, output.index);
-                    if (released != AV_ERR_OK) {
-                        Fail("归还视频输出失败，错误码 " + std::to_string(released));
-                        std::lock_guard<std::mutex> lock(mutex_); callbackError_ = released;
-                    }
-                    continue;
-                }
+                if (!codec_ || OH_AVBuffer_GetBufferAttr(output.data, &attr) != AV_ERR_OK) continue;
                 if (attr.flags & (AVCODEC_BUFFER_FLAGS_EOS | AVCODEC_BUFFER_FLAGS_CODEC_DATA)) {
-                    const auto released = OH_VideoDecoder_FreeOutputBuffer(codec_, output.index);
-                    if (released != AV_ERR_OK) {
-                        Fail("归还视频输出失败，错误码 " + std::to_string(released));
-                        std::lock_guard<std::mutex> lock(mutex_); callbackError_ = released;
-                    }
-                    continue;
+                    OH_VideoDecoder_FreeOutputBuffer(codec_, output.index); continue;
                 }
                 const auto result = OH_VideoDecoder_RenderOutputBuffer(codec_, output.index);
                 bool stable = false;
@@ -648,7 +489,6 @@ private:
                     }
                     if (changed) {
                         Destroy(); ready.clear(); waitingKey = true; readback.Reset();
-                        diagnosticGop.Reset(); diagnosticConfiguration.clear();
                         { std::lock_guard<std::mutex> lock(mutex_); stats_.waitingKeyAt = Now();
                           stats_.configurationRetained = false; captured_ = {}; }
                         restartEvidence("parameter-change"); LogState("reset", surface);
@@ -704,28 +544,6 @@ private:
                     std::lock_guard<std::mutex> lock(mutex_); ++stats_.submitted; stats_.submittedAt = Now();
                     if (unit.randomAccess) ++stats_.acceptedRandomAccess;
                 }
-                if (diagnosticsEnabled_) {
-                    try {
-                        if (unit.randomAccess) {
-                            diagnosticConfiguration.clear();
-                            diagnosticConfigurationComplete = parameters.Mask() == 7;
-                            for (unsigned i = 0; i < 3; ++i) {
-                                if (parameters[i].size() > 16 * 1024 - diagnosticConfiguration.size()) {
-                                    diagnosticConfiguration.clear(); diagnosticConfigurationComplete = false; break;
-                                }
-                                diagnosticConfiguration.insert(diagnosticConfiguration.end(), parameters[i].begin(), parameters[i].end());
-                            }
-                            neo::VideoParameterCache<neo::Bytes> present;
-                            bool picture = false; Parameters(unit.bytes, picture, present);
-                            diagnosticFirstParameterMask = present.Mask();
-                            diagnosticRecordingFailed = false;
-                        }
-                        diagnosticGop.Record(unit.bytes, unit.randomAccess);
-                    } catch (const std::exception &) {
-                        diagnosticGop.Reset(); diagnosticRecordingFailed = true;
-                        OH_LOG_Print(LOG_APP, LOG_WARN, 0, "NeoVideo", "diagnostic-recording-failed");
-                    }
-                }
                 readback.Feed(std::move(unit), stream.Width(), stream.Height(), parameters);
                 lastInput = Now();
             }
@@ -745,9 +563,6 @@ private:
             int64_t lastOutput;
             { std::lock_guard<std::mutex> lock(mutex_); lastOutput = stats_.decodedAt; }
             if (codec_ && lastInput > std::max(startedAt, lastOutput) && Now() - std::max(startedAt, lastOutput) > 2500) {
-                readback.LogState("preview-stall", ticket);
-                SaveDiagnostic(diagnosticGop, diagnosticConfiguration, diagnosticFirstParameterMask,
-                    diagnosticConfigurationComplete, diagnosticRecordingFailed, readback);
                 Fail("视频解码停滞，正在等待新的关键帧"); recovery.Failed();
                 reset("decode-stall", neo::VideoResetScope::Decoder);
             }
@@ -761,7 +576,7 @@ private:
                 break;
             }
             if (Now() - lastStatsLog >= 5000) {
-                lastStatsLog = Now(); LogState("stats", surface); readback.LogState("stats", ticket);
+                lastStatsLog = Now(); LogState("stats", surface);
             }
         }
         Destroy();
@@ -773,9 +588,6 @@ private:
     bool stopping_ = true, discontinuity_ = false; int32_t callbackError_ = 0;
     uint64_t pendingSurface_ = 0;
     uint64_t codecSequence_ = 0;
-    std::string diagnosticDirectory_;
-    std::atomic<bool> diagnosticsEnabled_{false};
-    unsigned nextDiagnosticSlot_ = 0;
     uint32_t captureSequence_ = 0, captureTicket_ = 0;
     CapturedFrame captured_;
     uint64_t rejected_ = 0;
@@ -815,29 +627,6 @@ napi_value SwitchSurface(napi_env env, napi_callback_info info) {
     return result;
 }
 napi_value Stop(napi_env env, napi_callback_info) { preview.Stop(); return Undefined(env); }
-napi_value SetDiagnosticDirectory(napi_env env, napi_callback_info info) {
-    size_t count = 1, length = 0;
-    napi_value arg;
-    napi_get_cb_info(env, info, &count, &arg, nullptr, nullptr);
-    if (count != 1 || napi_get_value_string_utf8(env, arg, nullptr, 0, &length) != napi_ok || length > 1024) {
-        napi_throw_type_error(env, nullptr, "Invalid private diagnostic directory"); return nullptr;
-    }
-    std::string directory(length + 1, '\0');
-    if (napi_get_value_string_utf8(env, arg, directory.data(), directory.size(), &length) != napi_ok) return Undefined(env);
-    directory.resize(length);
-    if (!preview.SetDiagnosticDirectory(std::move(directory))) {
-        napi_throw_type_error(env, nullptr, "Diagnostic directory must be inside this app's private files"); return nullptr;
-    }
-    return Undefined(env);
-}
-napi_value CancelFrame(napi_env env, napi_callback_info info) {
-    size_t count = 1;
-    napi_value arg;
-    uint32_t ticket = 0;
-    napi_get_cb_info(env, info, &count, &arg, nullptr, nullptr);
-    if (count == 1 && napi_get_value_uint32(env, arg, &ticket) == napi_ok) preview.CancelFrame(ticket);
-    return Undefined(env);
-}
 napi_value RequestFrame(napi_env env, napi_callback_info) {
     napi_value result;
     napi_create_uint32(env, preview.RequestFrame(), &result);
@@ -899,9 +688,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"start", nullptr, Start, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"switchSurface", nullptr, SwitchSurface, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"stop", nullptr, Stop, nullptr, nullptr, nullptr, napi_default, nullptr},
-        {"setDiagnosticDirectory", nullptr, SetDiagnosticDirectory, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"requestFrame", nullptr, RequestFrame, nullptr, nullptr, nullptr, napi_default, nullptr},
-        {"cancelFrame", nullptr, CancelFrame, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"takeFrame", nullptr, TakeFrame, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"submit", nullptr, Submit, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"snapshot", nullptr, Snapshot, nullptr, nullptr, nullptr, napi_default, nullptr}};

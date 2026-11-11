@@ -46,36 +46,6 @@ Recovery still requires a new random-access picture and valid dimensions.
 The native preview reports `configurationRetained` and `waitingForKeyAgeMs`
 so a long keyframe wait can be distinguished from resumed decode output.
 
-`node tests/native/run_video_output_ownership_test.cjs` executes the actual
-native output-consumer branch against device API doubles. Metadata failures
-must return their output index; non-picture release failures must reach the
-existing recovery path. This fixes a separate resource leak, not a proven cause
-of the observed 2026-11-11 hardware decoder stalls (both output pools were owned
-by OMX at those stalls).
-
-`node tests/native/run_video_diagnostic_gop_test.cjs` checks byte-preserving GOP
-capture, the 8MiB storage ceiling, overflow remaining incomplete until another
-IRAP, and two-slot rotation. `setDiagnosticDirectory` enables recording inside
-the app's private files directory. On a decode stall only, `stall-0`/`stall-1`
-contain the raw submitted `.h265` and a `.json` sidecar. Configuration is recorded
-separately as `configurationPrefixHex`, never injected into the evidence stream.
-`firstAuParameterMask` says which VPS/SPS/PPS were present in its initial AU.
-An incomplete capture has metadata but no video file. Replay tools must check
-`complete` and `configurationPrefixComplete` before preparing a separate input.
-Readback progress records output availability and age/layout/metadata rejection
-counts on requests, periodic summaries and stalls without per-frame logs.
-`node tests/native/run_video_diagnostic_publish_test.cjs` covers publication
-faults: the previous manifest must be removed successfully before writing;
-temporary files are completed and renamed before the new manifest is published.
-Missing or malformed metadata is not a committed diagnostic sample.
-
-`node tests/native/run_video_frame_cancel_test.cjs` executes the real ticket
-methods and checks that cancellation clears only its matching request/result,
-leaving later tickets and the decoder session running.
-`node tests/native/run_video_readback_release_test.cjs` executes the production
-readback output loop and checks that a failed buffer return is logged and
-resets only the readback decoder, while a successful return keeps it running.
-
 `node tests/native/run_movie_audio_test.cjs` checks PCM layout, source looping,
 fades, cancellation and the final AAC timeline. It also runs the production
 `AudioSourceDuration.h` decision and normalization used after the BGM decoder

@@ -497,7 +497,7 @@ export struct AssistantSheet {
           .gesture(LongPressGesture({ repeat: false, duration: 1200 }).onAction(() => this.onSettings()))
         Text('无人机拍摄').fontSize(11).fontColor('#A0A0A8').margin({ left: 7 }).layoutWeight(1).maxLines(1)
         Button(this.state.connectionRecovering ? '连接准备中' : this.state.connectionReady ?
-          (this.state.connectionFrameReady ? '已连接' : '已连接 · 等待画面') : '连接飞机', { type: ButtonType.Normal }).fontSize(12)
+          (this.state.videoPreview.state === 'live' ? '已连接' : '已连接 · 等待画面') : '连接飞机', { type: ButtonType.Normal }).fontSize(12)
           .fontColor(this.state.connectionReady ? '#48765A' : '#B94860')
           .backgroundColor(this.state.connectionReady ? '#E4F4E8' : '#FFF0F2')
           .height(30).padding({ left: 10, right: 10 }).borderRadius(15)

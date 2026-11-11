@@ -127,19 +127,6 @@ test('a decoder restart during post-confirmation frame capture prevents action e
   assert.equal(events.includes('execute:follow'),false);
 });
 
-test('confirmed subject actions pass only their locked ID to capture while scan selection keeps all candidates',async()=>{
-  for(const action of ['follow','dolly_zoom']){
-    const {c,events}=await fixture({action});const capture=c.captureVlmFrame;const locked=[];
-    c.captureVlmFrame=async id=>{locked.push(id);return capture();};
-    await c.runCloudVoiceRequest('给黑衣服男生执行当前动作');
-    assert.ok(locked.length>=2);assert.ok(locked.every(id=>id===undefined), 'intent and selection use candidate reports');
-    await c.confirmSubjectTask();
-    if(action==='dolly_zoom')await c.executeSubjectPlan();
-    assert.equal(locked.at(-1),13,'only the confirmed action verifies the fixed target with tracking reports');
-    assert.ok(events.includes('execute:'+action));
-  }
-});
-
 test('direct model responses also reconcile prior media before any new ground takeoff',async()=>{
   const {c,events}=await fixture({action:'follow'},true);
   c.recoverPreviousGroundedVideo=async()=>{events.push('recover');};

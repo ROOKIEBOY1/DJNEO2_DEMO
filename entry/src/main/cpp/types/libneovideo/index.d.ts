@@ -31,7 +31,6 @@ export interface VideoPreviewStats {
 export const start: (surfaceId: string) => void;
 export const switchSurface: (surfaceId: string) => boolean;
 export const stop: () => void;
-export const setDiagnosticDirectory: (path: string) => void;
 export const submit: (bytes: ArrayBuffer) => void;
 export const snapshot: () => VideoPreviewStats;
 export interface DecodedFrame {
@@ -41,7 +40,6 @@ export interface DecodedFrame {
   capturedAtMs: number;
 }
 export const requestFrame: () => number;
-export const cancelFrame: (ticket: number) => void;
 export const takeFrame: (ticket: number) => DecodedFrame | undefined;
 export interface MovieExportSnapshot {
   id: number;
