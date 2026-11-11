@@ -219,6 +219,7 @@ export class AppController {
       this.emit();
     });
     this.session.setVideoFrameListener((frame: Uint8Array) => this.video.submit(frame));
+    this.session.setCameraTelemetryListener((): void => this.observeShootingTelemetry());
     this.session.setListener((state: DroneSessionSnapshot) => {
       this.video.setSession(this.videoSessionEnabled ? videoSessionIdentity(state.phase, state.sessionHex) : '');
       this.pollVideoKeyframeRecovery();
@@ -1193,14 +1194,26 @@ export class AppController {
     return `最新${kind === 'photo' ? '照片' : '录像'}已取回`;
   }
 
+  private observeShootingTelemetry(): void {
+    if (!this.videoSessionEnabled || this.session.snapshot().phase !== 'ready') return;
+    const telemetry = this.session.snapshot().telemetry;
+    // Each sink records local evidence only. Keep UI emission, downloads and
+    // aircraft operations outside the synchronous receive callback.
+    try {
+      const progress = this.nativeTasks.observeProgress();
+      if (progress !== undefined) this.log(progress);
+    } catch (error) { this.log(`录像状态观察异常（任务）：${asError(error).message}`); }
+    try { this.camera.observeTelemetry(telemetry); }
+    catch (error) { this.log(`录像状态观察异常（相机）：${asError(error).message}`); }
+    try { this.captureMedia.observe(telemetry, this.nativeTasks.activeOrUnknown()); }
+    catch (error) { this.log(`录像状态观察异常（素材）：${asError(error).message}`); }
+  }
+
   private async pollAutomaticMedia(): Promise<void> {
     if (!this.videoSessionEnabled || this.session.snapshot().phase !== 'ready') return;
-    const progress = this.nativeTasks.observeProgress();
-    if (progress !== undefined) this.log(progress);
+    this.observeShootingTelemetry();
     const taskActive = this.nativeTasks.activeOrUnknown();
     const telemetry = this.session.snapshot().telemetry;
-    this.camera.observeTelemetry(telemetry);
-    this.captureMedia.observe(telemetry, taskActive);
     const kind = this.captureMedia.readyKind();
     const flight = this.flight.snapshot();
     if ((flight.landRequested || flight.landSent) && ((telemetry.flightAgeMs ?? Infinity) > 1000 ||

@@ -45,12 +45,12 @@ export class TelemetryStore {
   private task?: TaskTelemetry;
   private camera?: CameraTelemetry;
 
-  observe(rawFrame: Uint8Array, observedAtMs: number): void {
+  observe(rawFrame: Uint8Array, observedAtMs: number): CameraTelemetry | undefined {
     let frame: DumlFrame;
     try {
       frame = decodeDumlFrame(rawFrame);
     } catch (_) {
-      return;
+      return undefined;
     }
     this.subject.observe(frame, observedAtMs);
     if (frame.sender === 3 && frame.commandSet === 3 && frame.commandId === 0x43 &&
@@ -87,7 +87,10 @@ export class TelemetryStore {
         recordStateRaw: (flags >>> 6) & 3,
         timeSynchronized: (flags & 4) !== 0
       };
+      // Preserve this accepted event before a later report replaces latest state.
+      return this.camera;
     }
+    return undefined;
   }
 
   snapshot(nowMs: number = Date.now()): TelemetrySnapshot {

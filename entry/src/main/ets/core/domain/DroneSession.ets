@@ -83,6 +83,7 @@ export interface DroneSessionSnapshot {
 
 export type SessionListener = (snapshot: DroneSessionSnapshot) => void;
 export type VideoFrameListener = (frame: Uint8Array) => void;
+export type CameraTelemetryListener = () => void;
 export type Channel3Handler = (packet: Uint8Array) => void;
 
 export class DroneSession {
@@ -119,6 +120,9 @@ export class DroneSession {
   private lastError: string = '';
   private listener?: SessionListener;
   private videoListener?: VideoFrameListener;
+  private cameraTelemetryListener?: CameraTelemetryListener;
+  private lastCameraStateLog: string = '';
+  private cameraObserverErrors: number = 0;
   private channel3Handler?: Channel3Handler;
   private profileId: string = '';
   private generation: number = 0;
@@ -140,6 +144,10 @@ export class DroneSession {
 
   setVideoFrameListener(listener?: VideoFrameListener): void {
     this.videoListener = listener;
+  }
+
+  setCameraTelemetryListener(listener?: CameraTelemetryListener): void {
+    this.cameraTelemetryListener = listener;
   }
 
   setChannel3Handler(handler?: Channel3Handler): void {
@@ -219,6 +227,7 @@ export class DroneSession {
       this.packetParseFailures = 0;
       this.sessionMismatches = 0;
       this.replyDiagnosticsLogged = 0;
+      this.lastCameraStateLog = ''; this.cameraObserverErrors = 0;
       this.phaseValue = SessionPhase.HANDSHAKING;
       this.emit();
       const packetHandler = (packet: Uint8Array, receivedAtMs: number): void => {
@@ -733,10 +742,31 @@ export class DroneSession {
       }
     }
     const messages = allDumlMessages(raw);
-    messages.forEach((message: Uint8Array) => {
+    const packetGeneration = this.generation;
+    for (let index = 0; index < messages.length; index++) {
+      if (this.generation !== packetGeneration) return;
+      const message = messages[index];
       this.registration?.observe(message);
-      this.telemetry.observe(message, receivedAtMs);
-    });
+      const camera = this.telemetry.observe(message, receivedAtMs);
+      if (camera !== undefined) {
+        const state = `${camera.modeRaw}/${camera.recordStateRaw}/${camera.timeSynchronized}`;
+        if (state !== this.lastCameraStateLog) {
+          this.lastCameraStateLog = state;
+          hilog.info(LOG_DOMAIN, LOG_TAG,
+            'camera state generation=%{public}d at=%{public}d mode=%{public}d record=%{public}d synced=%{public}d',
+            packetGeneration, receivedAtMs, camera.modeRaw, camera.recordStateRaw, camera.timeSynchronized ? 1 : 0);
+        }
+        // Business evidence must see each accepted push synchronously. The UI
+        // notification below may coalesce recording -> idle into one snapshot.
+        try { this.cameraTelemetryListener?.(); }
+        catch (error) {
+          this.cameraObserverErrors++;
+          if (this.cameraObserverErrors <= 5) hilog.error(LOG_DOMAIN, LOG_TAG,
+            'camera observer failed count=%{public}d error=%{public}s', this.cameraObserverErrors, errorMessage(error));
+        }
+        if (this.generation !== packetGeneration) return;
+      }
+    }
     const pendingEntries = Array.from(this.pending.entries());
     pendingEntries.forEach((entry: [number, PendingCommand]) => {
       const sequence = entry[0];
