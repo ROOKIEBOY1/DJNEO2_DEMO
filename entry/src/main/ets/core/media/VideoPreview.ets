@@ -85,6 +85,14 @@ export class VideoPreview {
     this.stop(); this.sessionId = identity; this.start();
   }
 
+  // Explicit user recovery may reopen a locally paused decoder. Automatic
+  // keyframe requests never call this or reset the native failure budget.
+  restart(): boolean {
+    if (this.surfaceId.length === 0 || this.sessionId.length === 0) return false;
+    this.stop(); this.start();
+    return this.active;
+  }
+
   submit(frame: Uint8Array): void {
     if (!this.active) return;
     try { this.backend.submit(new Uint8Array(frame).buffer as ArrayBuffer); }

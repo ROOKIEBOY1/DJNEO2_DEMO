@@ -1,4 +1,5 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { systemDateTime } from '@kit.BasicServicesKit';
 import { allDumlMessages, buildFlyTunnel, buildTunnelCommand, buildTunneledRequest,
   findCommandReply } from '../protocol/CommandCodec';
 import { concatBytes, toHex } from '../protocol/Bytes';
@@ -14,6 +15,7 @@ import { RegistrationExchange, RegistrationSnapshot } from '../transport/Registr
 import { ReliableTransport, ReliableTransportSnapshot } from '../transport/ReliableTransport';
 import { resequenceTunnels, RoutingSequenceSnapshot, RoutingSequenceStore } from '../transport/RoutingSequenceStore';
 import { AircraftProfileRuntime } from '../profile/AircraftProfileStore';
+import { buildVideoKeyframeRequest } from '../protocol/VideoKeyframeCodec';
 
 const LOG_DOMAIN: number = 0x0000;
 const LOG_TAG: string = 'NeoSession';
@@ -39,7 +41,25 @@ interface PendingCommand {
   timer: number;
 }
 
+export interface VideoKeyframeClock {
+  nowMs(): number;
+  schedule(callback: () => void, delayMs: number): number;
+  cancel(timer: number): void;
+}
+
+interface VideoKeyframePulse {
+  generation: number;
+  session: number;
+  transport: ReliableTransport;
+  channel: DroneUdpChannel;
+  resetTimer?: number;
+  cancelSends: (() => void)[];
+  trueDone: boolean;
+  resetDone: boolean;
+}
+
 export interface DroneSessionSnapshot {
+  generation: number;
   phase: SessionPhase;
   sessionHex: string;
   networkInterface: string;
@@ -105,8 +125,14 @@ export class DroneSession {
   private packetParseFailures: number = 0;
   private sessionMismatches: number = 0;
   private replyDiagnosticsLogged: number = 0;
+  private readonly keyframeClock: VideoKeyframeClock;
+  private keyframePulse?: VideoKeyframePulse;
+  private keyframeGeneration?: number;
+  private keyframeAttemptAtMs?: number;
 
-  constructor() {}
+  constructor(keyframeClock: VideoKeyframeClock = videoKeyframeClock()) {
+    this.keyframeClock = keyframeClock;
+  }
 
   setListener(listener?: SessionListener): void {
     this.listener = listener;
@@ -334,6 +360,7 @@ export class DroneSession {
   snapshot(): DroneSessionSnapshot {
     const now = Date.now();
     return {
+      generation: this.generation,
       phase: this.phaseValue,
       sessionHex: this.session === 0 ? '--' : `0x${this.session.toString(16).padStart(4, '0')}`,
       networkInterface: this.selection?.interfaceName ?? '--',
@@ -436,6 +463,99 @@ export class DroneSession {
     const outer = this.nextOuter();
     return this.requestReliable(buildTunneledRequest(receiver, commandSet, commandId, payload, inner, outer),
       inner, commandSet, commandId, receiver, timeoutMs);
+  }
+
+  // Direct 02 -> E9 18/47 video control; it has no task tunnel or DUML ACK waiter.
+  async requestVideoKeyframe(reason: 'manual' | 'automatic' = 'manual'): Promise<void> {
+    if (reason !== 'manual' && reason !== 'automatic') throw new Error('关键帧请求来源无效');
+    if (this.keyframeGeneration !== undefined && this.keyframeGeneration !== this.generation) this.cancelKeyframePulse();
+    const transport = this.transport;
+    const controlAge = this.lastControlReceivedAt === undefined ? Infinity : Date.now() - this.lastControlReceivedAt;
+    if (this.phaseValue !== SessionPhase.READY || !this.deviceVerified || transport === undefined ||
+      this.routing === undefined || this.lastError.length > 0 || controlAge < 0 || controlAge > 1000) {
+      throw new Error('关键帧请求需要已核验的新鲜可靠连接');
+    }
+    const now = this.keyframeNow();
+    if (this.keyframePulse !== undefined) throw new Error('关键帧请求正在处理中');
+    if (this.keyframeAttemptAtMs !== undefined && now - this.keyframeAttemptAtMs < 5000) {
+      throw new Error('已请求关键帧，请间隔至少 5 秒');
+    }
+    const pulse: VideoKeyframePulse = { generation: this.generation, session: this.session,
+      transport: transport, channel: this.channel, cancelSends: [], trueDone: false, resetDone: false };
+    this.keyframePulse = pulse; this.keyframeGeneration = this.generation; this.keyframeAttemptAtMs = now;
+    // Schedule before waiting for the platform send callback. A late callback
+    // must not delay deassertion or the existing stick/ACK tick.
+    pulse.resetTimer = this.keyframeClock.schedule((): void => {
+      pulse.resetTimer = undefined;
+      this.resetVideoKeyframe(pulse).catch((error: Error) => {
+        if (this.currentKeyframePulse(pulse)) hilog.error(LOG_DOMAIN, LOG_TAG,
+          'keyframe reset failed generation=%{public}d error=%{public}s', pulse.generation, error.message);
+      });
+    }, 120);
+    hilog.info(LOG_DOMAIN, LOG_TAG, 'keyframe request reason=%{public}s generation=%{public}d', reason, pulse.generation);
+    try { await this.sendVideoKeyframe(pulse, now, true); }
+    finally { pulse.trueDone = true; this.releaseKeyframePulse(pulse); }
+  }
+
+  private keyframeNow(): number {
+    const now = this.keyframeClock.nowMs();
+    if (!Number.isSafeInteger(now) || now < 0) throw new Error('关键帧单调时钟无效');
+    return now;
+  }
+
+  private currentKeyframePulse(pulse: VideoKeyframePulse): boolean {
+    // The channel's socket is opened only by connect(), after generation changes.
+    // Capture both facade and transport so an old timer cannot use a replacement.
+    return this.keyframePulse === pulse && this.phaseValue === SessionPhase.READY &&
+      this.generation === pulse.generation && this.session === pulse.session &&
+      this.transport === pulse.transport && this.channel === pulse.channel;
+  }
+
+  private async resetVideoKeyframe(pulse: VideoKeyframePulse): Promise<void> {
+    try {
+      if (!this.currentKeyframePulse(pulse)) return;
+      // This deasserts an already attempted true. Temporary downlink staleness,
+      // a newly rendered image, or a task/decoder change must not suppress it.
+      await this.sendVideoKeyframe(pulse, this.keyframeNow(), false);
+      if (this.currentKeyframePulse(pulse)) hilog.info(LOG_DOMAIN, LOG_TAG,
+        'keyframe reset sent generation=%{public}d', pulse.generation);
+    } catch (error) {
+      if (this.currentKeyframePulse(pulse)) hilog.error(LOG_DOMAIN, LOG_TAG,
+        'keyframe reset unconfirmed generation=%{public}d error=%{public}s', pulse.generation, errorMessage(error));
+    } finally { pulse.resetDone = true; this.releaseKeyframePulse(pulse); }
+  }
+
+  private sendVideoKeyframe(pulse: VideoKeyframePulse, now: number, enabled: boolean): Promise<void> {
+    if (!this.currentKeyframePulse(pulse)) return Promise.reject(new Error('关键帧请求会话已变化'));
+    const frame = buildVideoKeyframeRequest(this.nextInner(), now, enabled);
+    return new Promise<void>((resolve: () => void, reject: (error: Error) => void) => {
+      let finished: boolean = false;
+      let timer: number | undefined;
+      let cancel: () => void = (): void => {};
+      const finish = (error?: Error): void => {
+        if (finished) return;
+        finished = true;
+        if (timer !== undefined) this.keyframeClock.cancel(timer);
+        pulse.cancelSends = pulse.cancelSends.filter((callback: () => void): boolean => callback !== cancel);
+        if (error === undefined) resolve(); else reject(error);
+      };
+      cancel = (): void => finish(new Error('关键帧请求已取消或会话已变化'));
+      pulse.cancelSends.push(cancel);
+      timer = this.keyframeClock.schedule((): void => finish(new Error('关键帧发送等待超时')), 500);
+      this.sendReliable(frame).then((): void => finish(), (error: Error): void => finish(new Error(errorMessage(error))));
+    });
+  }
+
+  private releaseKeyframePulse(pulse: VideoKeyframePulse): void {
+    if (this.keyframePulse === pulse && pulse.trueDone && pulse.resetDone) this.keyframePulse = undefined;
+  }
+
+  private cancelKeyframePulse(): void {
+    const pulse = this.keyframePulse;
+    this.keyframePulse = undefined; this.keyframeGeneration = undefined; this.keyframeAttemptAtMs = undefined;
+    if (pulse === undefined) return;
+    if (pulse.resetTimer !== undefined) this.keyframeClock.cancel(pulse.resetTimer);
+    pulse.cancelSends.slice().forEach((cancel: () => void): void => cancel());
   }
 
   private async queryDevice(timeoutMs: number): Promise<boolean> {
@@ -739,6 +859,7 @@ export class DroneSession {
   private async cleanup(): Promise<void> {
     // Invalidate pending callbacks before awaiting any asynchronous resource close.
     this.generation++;
+    this.cancelKeyframePulse();
     const generation = this.generation;
     const routing = this.routing;
     this.ticking = false;
@@ -765,6 +886,16 @@ export class DroneSession {
     this.selection = undefined;
     this.profileId = '';
   }
+}
+
+function videoKeyframeClock(): VideoKeyframeClock {
+  return new SystemVideoKeyframeClock();
+}
+
+class SystemVideoKeyframeClock implements VideoKeyframeClock {
+  nowMs(): number { return systemDateTime.getUptime(systemDateTime.TimeType.STARTUP, false); }
+  schedule(callback: () => void, delayMs: number): number { return setTimeout(callback, delayMs); }
+  cancel(timer: number): void { clearTimeout(timer); }
 }
 
 function delay(milliseconds: number): Promise<void> {

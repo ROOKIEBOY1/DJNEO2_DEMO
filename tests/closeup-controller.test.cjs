@@ -3,17 +3,23 @@ const {AppController}=require('../entry/src/main/ets/core/domain/AppController.e
 const {CloseupSequence}=require('../entry/src/main/ets/core/domain/CloseupSequence.ets');
 const {CloseupMediaGroup}=require('../entry/src/main/ets/core/media/CloseupMediaGroup.ets');
 
+function progressStats(overrides={}){
+  return {running:true,waitingForKey:false,lastAssembledAgeMs:0,recoveryPaused:false,
+    decoderEpoch:1,renderedFrames:Math.floor(Date.now()/33)+1,lastRenderedAgeMs:0,...overrides};
+}
+
 function fixture(){
   const c=Object.create(AppController.prototype);const calls=[];const target=13;let nativeStarted;
   const obs=()=>({requestId:'frame-'+calls.length,sessionId:10,flightGeneration:2,controlGeneration:0,
-    requestedAtMs:Date.now(),frame:{currentSubjectId:target,candidates:[{id:target}]}});
+    requestedAtMs:Date.now(),frame:{currentSubjectId:target,candidates:[{id:target}],
+      sessionId:10,capturedAtMs:Date.now(),candidatesObservedAtMs:Date.now(),
+      jpeg:Uint8Array.of(1).buffer,width:2,height:2}});
   Object.assign(c,{agentGeneration:0,agentMediaUris:['old'],agentMediaUri:'old',agentVideoResultReady:true,agentFeedback:'',
     closeupSequence:new CloseupSequence(()=>{}),closeupMedia:new CloseupMediaGroup(),emit(){},log(){},
     session:{sessionId:()=>10,isReliableLinkFresh:()=>true,snapshot:()=>({phase:'ready',telemetry:{
       flight:{modeRaw:26,airborne:true,motorsOn:true},flightAgeMs:0,subject:{tracking:true,overlay:[{id:target}],trackingAt:Date.now()}}})},
     nativeTasks:{snapshot:()=>({startedAtMs:nativeStarted})},
-    video:{snapshot:()=>({state:'live',stats:{running:true,waitingForKey:false,
-      lastAssembledAgeMs:0,recoveryPaused:false,decoderEpoch:1}})},
+    video:{snapshot:()=>({state:'live',stats:progressStats()})},
     captureMedia:{beginVideoSequence:async()=>{calls.push(['baseline']);return 42;},
       finishVideoSequence:id=>{calls.push(['allow-return',id]);},
       releaseVideoSequence:(id,discard)=>{calls.push(['release',id,discard]);}},
@@ -199,7 +205,7 @@ test('same-ID candidates or expired same-ID tracking cannot authorize the circle
       subject:{tracking,trackingAt:0,overlay:[{id:13}],candidates:[{id:13}],selectedIdCandidate:13}}});
     c.captureAgentObservation=async()=>{frames++;throw Error('must not capture without fresh tracking');};
     await withCloseupClock(1000,()=>{},async()=>{
-      await assert.rejects(c.waitForCloseupTarget(()=>true,13),/未恢复原主体.*未启动环绕/);
+      await assert.rejects(c.waitForCloseupTarget(()=>true,13),/恢复原主体.*未启动环绕/);
     });
     assert.equal(frames,0);
   }
@@ -236,10 +242,10 @@ test('a missing handoff frame is refreshed, while an explicit different fresh ID
 
 function recoveringHandoff(){
   const f=fixture();let freshAt=Infinity,staleAt=Infinity,targetAt=Infinity,cancelAt=Infinity;
-  f.c.video.snapshot=()=>Date.now()>=freshAt?{state:'live',stats:{running:true,waitingForKey:false,
-    lastAssembledAgeMs:Date.now()>=staleAt?2000:20,recoveryPaused:false}}:
-    {state:'error',stats:{running:true,waitingForKey:true,lastResetReason:'decode-stall',
-      lastAssembledAgeMs:Date.now()>=staleAt?2000:20,recoveryPaused:false}};
+  f.c.video.snapshot=()=>Date.now()>=freshAt?{state:'live',stats:progressStats({
+    lastAssembledAgeMs:Date.now()>=staleAt?2000:20})}:
+    {state:'error',stats:progressStats({waitingForKey:true,lastResetReason:'decode-stall',
+      lastAssembledAgeMs:Date.now()>=staleAt?2000:20})};
   f.c.session.snapshot=()=>({phase:'ready',telemetry:{flight:{modeRaw:26,airborne:true,motorsOn:true},flightAgeMs:0,
     subject:{tracking:true,overlay:[{id:Date.now()>=targetAt?11:13}],trackingAt:Date.now()}}});
   f.c.captureAgentObservation=async()=>Date.now()>=freshAt?f.obs():{...f.obs(),frame:undefined};
@@ -248,28 +254,28 @@ function recoveringHandoff(){
 }
 
 test('same-target hover waits for a new keyframe beyond eight seconds without accepting an old frame',async()=>{
-  const f=recoveringHandoff();f.configure({freshAt:27000});
+  const f=recoveringHandoff();f.configure({freshAt:11000});
   await withCloseupClock(1000,()=>{},async now=>{
     const result=await f.c.waitForCloseupTarget(f.current,13);
-    assert.equal(result.frame.currentSubjectId,13);assert.equal(now(),27000);
+    assert.equal(result.frame.currentSubjectId,13);assert.equal(now(),12000);
   });
 });
 
 test('decoder recovery handoff is bounded and explains the missing live picture',async()=>{
   const f=recoveringHandoff();
   await withCloseupClock(1000,()=>{},async now=>{
-    await assert.rejects(f.c.waitForCloseupTarget(f.current,13),/实时画面恢复超时.*未启动环绕/);
-    assert.equal(now(),31000);
+    await assert.rejects(f.c.waitForCloseupTarget(f.current,13),/实时画面恢复.*超时.*未启动环绕/);
+    assert.equal(now(),16000);
   });
 });
 
 test('receiving a keyframe still waits for new decoded pixels before authorizing handoff',async()=>{
-  const f=recoveringHandoff();f.configure({freshAt:27500});let captures=0;
+  const f=recoveringHandoff();f.configure({freshAt:11500});let captures=0;
   const preview=f.c.video.snapshot,observe=f.c.captureAgentObservation;
-  f.c.video.snapshot=()=>{const p=preview();return Date.now()>=27000?{...p,stats:{...p.stats,waitingForKey:false}}:p;};
-  f.c.captureAgentObservation=async()=>{captures++;assert.ok(Date.now()>=27500);return observe();};
+  f.c.video.snapshot=()=>{const p=preview();return Date.now()>=11000?{...p,stats:{...p.stats,waitingForKey:false}}:p;};
+  f.c.captureAgentObservation=async()=>{captures++;assert.ok(Date.now()>=12500);return observe();};
   await withCloseupClock(1000,()=>{},async now=>{
-    await f.c.waitForCloseupTarget(f.current,13);assert.equal(now(),27500);assert.equal(captures,1);
+    await f.c.waitForCloseupTarget(f.current,13);assert.equal(now(),12500);assert.equal(captures,1);
   });
 });
 
@@ -289,13 +295,17 @@ test('an extended recovery never survives a changed target, stale stream, or can
   }
 });
 
-test('unrecoverable or absent stream keeps the original eight-second handoff deadline',async()=>{
-  for(const changes of [{lastAssembledAgeMs:2000},{recoveryPaused:true},{running:false},{lastResetReason:'input-queue-discontinuity'}]){
+test('unavailable input is rejected and an unlabelled decoder stall keeps a bounded picture deadline',async()=>{
+  for(const [changes,wantAt,reason] of [
+    [{lastAssembledAgeMs:2000},1000,/图传状态已失效/],
+    [{recoveryPaused:true},1000,/图传状态已失效/],
+    [{running:false},1000,/图传状态已失效/],
+    [{lastResetReason:'input-queue-discontinuity'},16000,/实时画面恢复.*超时/]]){
     const f=recoveringHandoff();const preview=f.c.video.snapshot;
     f.c.video.snapshot=()=>{const p=preview();return {...p,stats:{...p.stats,...changes}};};
     await withCloseupClock(1000,()=>{},async now=>{
-      await assert.rejects(f.c.waitForCloseupTarget(f.current,13),/未恢复原主体.*未启动环绕/);
-      assert.equal(now(),9000);
+      await assert.rejects(f.c.waitForCloseupTarget(f.current,13),reason);
+      assert.equal(now(),wantAt);
     });
   }
 });
@@ -327,8 +337,8 @@ test('recovery rechecks hover and stream after capture instead of accepting an o
 test('a decoder reset during JPEG capture discards that observation and obtains new pixels',async()=>{
   for(const change of ['waiting','epoch']){
     const f=fixture();let captures=0,epoch=1,waiting=false;
-    f.c.video.snapshot=()=>({state:waiting?'error':'live',stats:{running:true,waitingForKey:waiting,
-      decoderEpoch:epoch,lastAssembledAgeMs:0,recoveryPaused:false,lastResetReason:'decode-stall'}});
+    f.c.video.snapshot=()=>({state:waiting?'error':'live',stats:progressStats({waitingForKey:waiting,
+      decoderEpoch:epoch,lastResetReason:'decode-stall'})});
     f.c.captureAgentObservation=async()=>{captures++;
       if(captures===1){if(change==='waiting')waiting=true;else epoch++;}
       return f.obs();

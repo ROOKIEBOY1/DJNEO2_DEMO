@@ -64,3 +64,16 @@ test('preview starts before opening the handshake socket so the initial codec pa
   assert.equal(videoSessionIdentity('closing','0x1234'),'');
   assert.equal(videoSessionIdentity('selecting_network','0x1234'),'');
 });
+
+test('manual preview restart needs an existing surface and aircraft identity', () => {
+  const {video,events}=setup();
+  assert.equal(video.restart(),false);
+  video.attach('123'); assert.equal(video.restart(),false);
+  assert.deepEqual(events,[]);
+});
+
+test('manual preview restart only reopens the decoder and retains its surface/session', () => {
+  const {video,events}=setup(); video.setSession('aircraft'); video.attach('123');
+  assert.equal(video.restart(),true); video.submit(new Uint8Array([1]));
+  assert.deepEqual(events,['start:123','stop','start:123','frame:1']);
+});

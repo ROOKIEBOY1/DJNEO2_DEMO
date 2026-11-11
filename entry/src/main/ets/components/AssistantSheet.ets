@@ -282,6 +282,17 @@ export struct AssistantSheet {
       if (epoch === this.epoch) this.status = error instanceof Error ? error.message : '录像取回失败，可重试';
     } finally { if (epoch === this.epoch) this.processing = false; }
   }
+  private async recoverVideoPreview(): Promise<void> {
+    const epoch = this.epoch;
+    const session = this.controller.snapshot().session;
+    try { await this.controller.recoverVideoPreview(); }
+    catch (error) {
+      if (!this.appeared || epoch !== this.epoch) return;
+      const current = this.controller.snapshot().session;
+      if (session.generation !== current.generation || session.sessionHex !== current.sessionHex) return;
+      this.status = error instanceof Error ? error.message : '画面恢复请求未完成';
+    }
+  }
 
   @Builder
   liveCard() {
@@ -323,6 +334,16 @@ export struct AssistantSheet {
         this.state.videoPreview.stats.width / this.state.videoPreview.stats.height : 16 / 9)
         .backgroundColor('#17171C').borderRadius(18).clip(true)
         .visibility(this.resultVisible() ? Visibility.None : Visibility.Visible)
+      if (!this.resultVisible()) {
+        Row({ space: 10 }) {
+          Text(this.state.videoKeyframeRecovery?.message ?? '').fontSize(11).fontColor('#8B949C')
+            .layoutWeight(1).lineHeight(17)
+          Button('恢复画面').fontSize(12).height(30).fontColor('#6559E8').backgroundColor('#EBE8FF')
+            .enabled(this.state.connectionReady && this.state.videoKeyframeRecovery?.pending !== true &&
+              !this.listening && !this.processing && !this.accepting)
+            .onClick(() => this.recoverVideoPreview())
+        }.width('100%')
+      }
       if (subjectTaskSnapshot(this.state).stage === 'confirm') {
           Button(subjectConfirmationLabel(this.state)).width('100%').height(44).fontSize(15).fontWeight(FontWeight.Medium)
             .backgroundColor('#6559E8').borderRadius(22)

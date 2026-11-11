@@ -68,3 +68,56 @@ test('sheet retains one-click plan execution through the generic controller entr
   assert.deepEqual(calls, ['execute']);
   assert.equal(sheet.status, '方案已执行');
 });
+
+function recoverySheetFixture() {
+  const { sheet } = sheetFixture();
+  let generation = 1, fail;
+  Object.assign(sheet, { appeared: true, status: '原状态', resultPlaybackEpoch: 0,
+    autoScroll: { stop() {} } });
+  sheet.controller.snapshot = () => ({ session: { generation, sessionHex: '0x0007' } });
+  sheet.controller.recoverVideoPreview = () => new Promise((_resolve, reject) => { fail = reject; });
+  sheet.controller.stopSubjectDescription = async () => {};
+  sheet.controller.land = async () => {};
+  return { sheet, fail: () => fail(new Error('旧恢复请求失败')),
+    reconnect: () => { generation++; } };
+}
+
+test('sheet shows a current manual recovery failure', async () => {
+  const { sheet, fail } = recoverySheetFixture();
+  const pending = sheet.recoverVideoPreview(); fail(); await pending;
+  assert.equal(sheet.status, '旧恢复请求失败');
+});
+
+test('a late recovery failure cannot overwrite the real landing status', async () => {
+  const { sheet, fail } = recoverySheetFixture();
+  const pending = sheet.recoverVideoPreview(); sheet.land();
+  fail(); await pending;
+  assert.equal(sheet.status, '正在请求降落…');
+});
+
+test('a late recovery failure cannot overwrite the real listening status', async () => {
+  const { sheet, fail } = recoverySheetFixture();
+  let finishListening;
+  sheet.controller.listenForSubjectDescription = ready => {
+    ready(); return new Promise(resolve => { finishListening = resolve; });
+  };
+  sheet.controller.executeLocalFlightVoice = async () => ({ message: '语音已处理' });
+  const pending = sheet.recoverVideoPreview(), listening = sheet.speak();
+  fail(); await pending;
+  assert.equal(sheet.status, '请说话，我在听…');
+  finishListening('降落'); await listening;
+});
+
+test('a late recovery failure cannot update a replacement session with the same session number', async () => {
+  const { sheet, fail, reconnect } = recoverySheetFixture();
+  const pending = sheet.recoverVideoPreview(); reconnect(); sheet.status = '新会话已连接';
+  fail(); await pending;
+  assert.equal(sheet.status, '新会话已连接');
+});
+
+test('a recovery failure after the sheet disappears is ignored', async () => {
+  const { sheet, fail } = recoverySheetFixture();
+  const pending = sheet.recoverVideoPreview(); sheet.aboutToDisappear(); sheet.status = '已关闭';
+  fail(); await pending;
+  assert.equal(sheet.status, '已关闭');
+});
