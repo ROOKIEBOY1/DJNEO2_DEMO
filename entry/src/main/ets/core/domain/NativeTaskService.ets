@@ -6,6 +6,10 @@ import { CameraService } from './CameraService';
 import { DroneSession } from './DroneSession';
 import { FlightCommandService } from './FlightCommandService';
 import { CancellationToken, ErrorLayer, failure, OperationResult, success } from './OperationResult';
+import { CameraTelemetry, TelemetryObservation } from './TelemetryStore';
+import { NativeTaskStopEvidence, NativeTaskStopReport } from './NativeTaskStopEvidence';
+import { TaskStopNotice } from './TaskStopNotice';
+import { ObstacleNoticeContext, ObstacleStopNotification } from './ObstacleStopNotification';
 
 export interface NativeTaskConfig { radiusMeters: number; framing: DollyFraming; zoom: number; retreat: boolean; }
 export interface NativeTaskSnapshot {
@@ -13,6 +17,8 @@ export interface NativeTaskSnapshot {
   recordingSeen: boolean;
   activeOrUnknown: boolean; config: NativeTaskConfig; startReply: string; stopReply: string;
   initialTargetTrackingAtMs?: number;
+  stopReport?: NativeTaskStopReport;
+  stopNotice?: TaskStopNotice;
 }
 export class NativeTaskService {
   private readonly session: DroneSession;
@@ -34,6 +40,14 @@ export class NativeTaskService {
   private recordingSeen: boolean = false;
   private initialTargetTrackingAtMs?: number;
   private hoverCompletionAtMs?: number;
+  private stopEvidence: NativeTaskStopEvidence = new NativeTaskStopEvidence();
+  private stopContextStartedAt?: number;
+  private stopContextKind: string = '';
+  private stopContextSession?: number;
+  private stopContextFlight?: number;
+  private stopContextInvalid: boolean = false;
+  private stopNotification: ObstacleStopNotification = new ObstacleStopNotification();
+  private stopNoticeSuppressed: boolean = false;
   constructor(session: DroneSession, flight: FlightCommandService, camera: CameraService) {
     this.session = session; this.flight = flight; this.camera = camera;
   }
@@ -43,13 +57,69 @@ export class NativeTaskService {
   // Called only after FlightCommandService has verified fresh post-cycle grounded telemetry.
   resetAfterGroundedCycle(): void {
     this.resetTaskState();
+    this.stopNotification.reset();
+    this.stopNoticeSuppressed = false;
   }
   private resetTaskState(): void {
-    this.cancel(); this.generation++; this.startedAt = undefined;
+    this.cancel(true); this.generation++; this.startedAt = undefined;
     this.startReply = ''; this.stopReply = '';
     this.lastProgress = ''; this.executionSeen = false; this.recordingSeen = false;
     this.hoverCompletionAtMs = undefined;
     this.initialTargetTrackingAtMs = undefined;
+    this.stopEvidence.reset(); this.stopContextStartedAt = undefined; this.stopContextInvalid = false;
+    // A completed imaging task may still be returning. Its notification remains
+    // observational across this handoff until return/velocity reports settle.
+  }
+
+  private ensureStopContext(): boolean {
+    if (this.startedAt === undefined) return false;
+    const session = this.session.snapshot().generation;
+    const flight = this.flight.snapshot().generation;
+    const newStart = this.stopContextStartedAt !== this.startedAt;
+    if (newStart || this.stopContextKind !== this.kind) {
+      this.stopEvidence.begin(this.kind, this.startedAt);
+      this.stopContextStartedAt = this.startedAt; this.stopContextKind = this.kind;
+      this.stopContextSession = session; this.stopContextFlight = flight; this.stopContextInvalid = false;
+      if (newStart) {
+        this.stopNotification.beginTask(); this.stopNoticeSuppressed = false;
+      }
+    } else if (this.stopContextSession !== session || this.stopContextFlight !== flight) {
+      this.stopEvidence.reset(); this.stopContextInvalid = true;
+      this.stopNotification.reset();
+      this.stopContextSession = session; this.stopContextFlight = flight;
+    }
+    return !this.stopContextInvalid;
+  }
+
+  observeTelemetry(observation: TelemetryObservation): void {
+    const context = this.noticeContext();
+    if (this.ensureStopContext()) {
+      if (observation.navigation !== undefined) this.stopEvidence.observeNavigation(observation.navigation);
+      if (observation.task !== undefined) this.stopEvidence.observeTask(observation.task);
+      if (observation.taskException !== undefined) this.stopEvidence.observeException(observation.taskException);
+      if (!this.stopNoticeSuppressed) this.stopNotification.capture(this.stopEvidence.snapshot(), this.kind, context);
+    }
+    // Continue observing return telemetry even after completeForHover clears the
+    // raw task context. No part of this observer issues an aircraft operation.
+    this.stopNotification.observe(observation, context);
+    this.cancelNoticeForOperatorMovement();
+  }
+
+  private noticeContext(): ObstacleNoticeContext {
+    return { sessionGeneration: this.session.snapshot().generation ?? 0,
+      flightGeneration: this.flight.snapshot().generation ?? 0 };
+  }
+
+  private cancelNoticeForOperatorMovement(): void {
+    const flight = this.flight.snapshot();
+    if (flight.movementActive || flight.landRequested || flight.landSent) {
+      this.stopNoticeSuppressed = true; this.stopNotification.cancel();
+    }
+  }
+
+  observeCameraTelemetry(camera: CameraTelemetry): void {
+    this.stopNotification.observe({ camera: camera }, this.noticeContext());
+    this.cancelNoticeForOperatorMovement();
   }
 
   canCompleteForHover(): OperationResult<boolean> {
@@ -85,6 +155,7 @@ export class NativeTaskService {
     if (this.startedAt === undefined) return undefined;
     const telemetry = this.session.snapshot().telemetry;
     const task = telemetry.task;
+    if (task !== undefined) this.observeTelemetry({ task: task });
     const camera = telemetry.camera;
     const taskFresh = task !== undefined && (telemetry.taskAgeMs ?? Infinity) <= 1000 && task.observedAtMs >= this.startedAt;
     const cameraFresh = camera !== undefined && (telemetry.cameraAgeMs ?? Infinity) <= 1000 && camera.observedAtMs >= this.startedAt;
@@ -97,12 +168,18 @@ export class NativeTaskService {
       `录像=${cameraFresh ? camera?.recordingCandidate : '未收到新鲜状态'}，` +
       `执行已观察=${this.executionSeen}，录像已观察=${this.recordingSeen}，` +
       `跟踪=${telemetry.subject?.tracking === true}，目标=${telemetry.subject?.overlay[0]?.id ?? '无'}，` +
-      `降落中=${flight.landRequested === true || flight.landSent === true}`;
+      `降落中=${flight.landRequested === true || flight.landSent === true}，` +
+      `任务状态线索=${JSON.stringify(this.stopEvidence.snapshot()) ?? '无'}`;
     if (message === this.lastProgress) return undefined;
     this.lastProgress = message;
     return message;
   }
-  cancel(): void { this.token?.cancel(); this.prepared = false; }
+  cancel(preserveStopNotice: boolean = false): void {
+    this.token?.cancel(); this.prepared = false;
+    if (!preserveStopNotice) {
+      this.stopNoticeSuppressed = true; this.stopNotification.cancel();
+    }
+  }
   activeOrUnknown(): boolean {
     if (this.startedAt === undefined) return false;
     const telemetry = this.session.snapshot().telemetry; const task = telemetry.task;
@@ -112,8 +189,13 @@ export class NativeTaskService {
         (task.payloadHex === '0000000100' && (this.executionSeen || this.recordingSeen || this.stopReply === '00'))));
   }
   snapshot(): NativeTaskSnapshot {
+    const stopReport = this.ensureStopContext() ? this.stopEvidence.snapshot() : undefined;
     const telemetry = this.session.snapshot().telemetry; const task = telemetry.task;
     const execution = this.kind === 'circle' ? '0505000100' : this.kind === 'follow' ? '050a000100' : '050d000100';
+    const context = this.noticeContext();
+    if (!this.stopNoticeSuppressed) this.stopNotification.capture(stopReport, this.kind, context);
+    this.cancelNoticeForOperatorMovement();
+    const stopNotice = this.stopNotification.snapshot(telemetry, context);
     return { kind: this.kind, prepared: this.prepared, busy: this.busy, startedAtMs: this.startedAt, executionSeen: this.executionSeen,
       recordingSeen: this.recordingSeen,
       executionObserved: task !== undefined && telemetry.taskAgeMs !== undefined && telemetry.taskAgeMs <= 1000 &&
@@ -121,6 +203,8 @@ export class NativeTaskService {
       activeOrUnknown: this.activeOrUnknown(),
       config: { radiusMeters: this.config.radiusMeters, framing: this.config.framing, zoom: this.config.zoom, retreat: this.config.retreat },
       initialTargetTrackingAtMs: this.initialTargetTrackingAtMs,
+      stopReport: stopReport,
+      stopNotice: stopNotice,
       startReply: this.startReply, stopReply: this.stopReply };
   }
   async prepareHover(kind: NativeTaskKind, config: NativeTaskConfig, external?: CancellationToken): Promise<OperationResult<boolean>> {
@@ -188,6 +272,7 @@ export class NativeTaskService {
       this.initialTargetTrackingAtMs = selectedTarget === undefined ? undefined :
         this.session.snapshot().telemetry.subject?.trackingAt;
       this.prepared = false; this.startedAt = Date.now(); this.used.push(this.kind);
+      this.stopContextStartedAt = undefined; this.ensureStopContext();
       this.lastProgress = ''; this.executionSeen = false; this.recordingSeen = false;
       this.hoverCompletionAtMs = undefined;
       this.stopReply = '';
@@ -203,6 +288,7 @@ export class NativeTaskService {
     finally { this.busy = false; }
   }
   async stop(timeoutMs: number = 400): Promise<OperationResult<string>> {
+    if (this.ensureStopContext()) this.stopEvidence.markAppStopRequested(Date.now());
     this.cancel();
     await this.flight.centerSticks();
     try {

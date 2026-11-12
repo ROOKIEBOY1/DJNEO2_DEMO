@@ -10,6 +10,19 @@ export interface FlightTelemetry {
   motorsOn: boolean;
   airborne: boolean;
   relativeHeightCandidateMeters: number;
+  velocityXMetersPerSecond: number;
+  velocityYMetersPerSecond: number;
+  velocityZMetersPerSecond: number;
+}
+
+export interface NavigationTelemetry {
+  observedAtMs: number;
+  modeRaw: number;
+  navigationExecuting: boolean;
+  goHomeExecuting: boolean;
+  goHomeStageRaw: number;
+  multiQuickShotEnabled: boolean;
+  payloadHex: string;
 }
 
 export interface TaskTelemetry {
@@ -27,6 +40,22 @@ export interface CameraTelemetry {
   timeSynchronized: boolean;
 }
 
+export interface TaskExceptionTelemetry {
+  observedAtMs: number;
+  codeRaw: number;
+  payloadHex: string;
+  sequence: number;
+  inAction: boolean;
+}
+
+export interface TelemetryObservation {
+  task?: TaskTelemetry;
+  taskException?: TaskExceptionTelemetry;
+  camera?: CameraTelemetry;
+  navigation?: NavigationTelemetry;
+  flight?: FlightTelemetry;
+}
+
 export interface TelemetrySnapshot {
   subject?: SubjectSnapshot;
   flight?: FlightTelemetry;
@@ -35,6 +64,9 @@ export interface TelemetrySnapshot {
   taskAgeMs?: number;
   camera?: CameraTelemetry;
   cameraAgeMs?: number;
+  taskException?: TaskExceptionTelemetry;
+  navigation?: NavigationTelemetry;
+  navigationAgeMs?: number;
 }
 
 export class TelemetryStore {
@@ -44,13 +76,20 @@ export class TelemetryStore {
   private flight?: FlightTelemetry;
   private task?: TaskTelemetry;
   private camera?: CameraTelemetry;
+  private taskException?: TaskExceptionTelemetry;
+  private navigation?: NavigationTelemetry;
 
   observe(rawFrame: Uint8Array, observedAtMs: number): CameraTelemetry | undefined {
+    return this.observeEvent(rawFrame, observedAtMs).camera;
+  }
+
+  observeEvent(rawFrame: Uint8Array, observedAtMs: number): TelemetryObservation {
+    const observed: TelemetryObservation = {};
     let frame: DumlFrame;
     try {
       frame = decodeDumlFrame(rawFrame);
     } catch (_) {
-      return undefined;
+      return observed;
     }
     this.subject.observe(frame, observedAtMs);
     if (frame.sender === 3 && frame.commandSet === 3 && frame.commandId === 0x43 &&
@@ -64,8 +103,12 @@ export class TelemetryStore {
         flagsRaw: flags,
         motorsOn: (flags & 8) !== 0,
         airborne: (flags & 4) !== 0,
-        relativeHeightCandidateMeters: view.getInt16(16, true) / 10
+        relativeHeightCandidateMeters: view.getInt16(16, true) / 10,
+        velocityXMetersPerSecond: view.getInt16(18, true) / 10,
+        velocityYMetersPerSecond: view.getInt16(20, true) / 10,
+        velocityZMetersPerSecond: view.getInt16(22, true) / 10
       };
+      observed.flight = this.flight;
     }
     if (frame.sender === 0x92 && frame.receiver === 2 && frame.flags === 0 &&
       frame.commandSet === 0x23 && frame.commandId === 0x14 && frame.payload.length === 5) {
@@ -75,6 +118,27 @@ export class TelemetryStore {
         modeRaw: frame.payload[1],
         payloadHex: toHex(frame.payload)
       };
+      observed.task = this.task;
+    }
+    // Observed Neo 2 QuickShot exception layout. Keep unknown codes raw; byte 8
+    // of 0A/5A is a different, packed navigation status and is not a reason.
+    if (frame.sender === 0x92 && frame.receiver === 2 && frame.flags === 0 &&
+      frame.commandSet === 0x0a && frame.commandId === 0x39 && frame.payload.length === 10 &&
+      frame.payload.slice(0, 6).every((value: number): boolean => value === 0)) {
+      this.taskException = { observedAtMs: observedAtMs, codeRaw: frame.payload[8],
+        payloadHex: toHex(frame.payload), sequence: frame.sequence, inAction: frame.payload[9] !== 0 };
+      observed.taskException = this.taskException;
+    }
+    // Current observed Neo 2 version/layout. MultiQuickShotEnabled is an enable
+    // flag, not proof that a QuickShot action or return movement is executing.
+    if (frame.sender === 0x92 && frame.receiver === 2 && frame.flags === 0 &&
+      frame.commandSet === 0x0a && frame.commandId === 0x5a && frame.payload.length === 19 &&
+      frame.payload[0] === 0xff && frame.payload[1] === 2 && frame.payload[2] === 0 && frame.payload[3] === 0) {
+      this.navigation = { observedAtMs: observedAtMs, modeRaw: (frame.payload[5] >> 1) & 15,
+        navigationExecuting: (frame.payload[5] & 1) !== 0,
+        goHomeExecuting: (frame.payload[8] & 1) !== 0, goHomeStageRaw: frame.payload[8] >> 4,
+        multiQuickShotEnabled: (frame.payload[13] & 1) !== 0, payloadHex: toHex(frame.payload) };
+      observed.navigation = this.navigation;
     }
     if (frame.sender === 1 && frame.receiver === 2 && frame.flags === 0 &&
       frame.commandSet === 2 && frame.commandId === 0x80 && frame.payload.length === 60) {
@@ -88,9 +152,9 @@ export class TelemetryStore {
         timeSynchronized: (flags & 4) !== 0
       };
       // Preserve this accepted event before a later report replaces latest state.
-      return this.camera;
+      observed.camera = this.camera;
     }
-    return undefined;
+    return observed;
   }
 
   snapshot(nowMs: number = Date.now()): TelemetrySnapshot {
@@ -106,6 +170,11 @@ export class TelemetryStore {
     if (this.camera !== undefined) {
       result.camera = this.camera;
       result.cameraAgeMs = Math.max(0, nowMs - this.camera.observedAtMs);
+    }
+    if (this.taskException !== undefined) result.taskException = this.taskException;
+    if (this.navigation !== undefined) {
+      result.navigation = this.navigation;
+      result.navigationAgeMs = Math.max(0, nowMs - this.navigation.observedAtMs);
     }
     return result;
   }

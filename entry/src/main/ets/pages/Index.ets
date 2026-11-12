@@ -8,6 +8,7 @@ import { DollyDemoWindow } from '../core/platform/DollyDemoWindow';
 import { AssistantSheet } from '../components/AssistantSheet';
 import { AssistantConversation } from '../core/domain/AssistantConversation';
 import { PreviewRecordingClock } from '../core/domain/PreviewRecordingClock';
+import { TaskStopNoticePresenter } from '../core/domain/TaskStopNotice';
 
 interface HeaderView { title: string; detail: string; }
 interface DiagnosticView { label: string; value: string; }
@@ -30,6 +31,7 @@ class VideoSurfaceController extends XComponentController {
 struct Index {
   private assistantConversation = new AssistantConversation();
   private previewRecordingClock = new PreviewRecordingClock();
+  private taskStopNotices = new TaskStopNoticePresenter();
   @State @Watch('assistantVisibilityChanged') showAssistant: boolean = false;
   @State showConsole: boolean = false;
   @State assistantHeight: number = 70;
@@ -75,6 +77,10 @@ struct Index {
       if (!snapshot.voice.listening && snapshot.agentFeedback.length > 0 &&
         snapshot.agentFeedback !== this.state.agentFeedback) this.vlmSampleStatus = snapshot.agentFeedback;
       this.state = snapshot;
+      this.taskStopNotices.present(snapshot.nativeTask.stopNotice, (message: string): void => {
+        promptAction.showToast({ message: message, duration: 3000 });
+        this.controller.recordTaskStopNotice(snapshot.nativeTask.stopNotice?.id ?? '', message);
+      });
       if (restore) this.videoSurface.restore();
       this.keepVideoScreenOn(snapshot.videoPreview.stats.running);
     });
@@ -412,6 +418,9 @@ struct Index {
             this.SectionHeader({ title: '原生任务', detail: this.state.nativeTask.executionObserved ? '已观察执行' : '尚未观察执行' })
             Text(`当前任务：${this.state.nativeTask.kind} · 启动回复：${this.state.nativeTask.startReply || '--'} · 停止回复：${this.state.nativeTask.stopReply || '--'}`)
               .fontSize(12).fontColor('#475467').width('100%')
+            if (this.state.nativeTask.stopNotice !== undefined) {
+              Text(this.state.nativeTask.stopNotice.message).fontSize(13).fontColor('#B54708').width('100%')
+            }
             Text(`环绕半径：${this.state.nativeConfig.radiusMeters}米（2–10米）`).width('100%').fontSize(14).margin({ top: 8 })
             Slider({ value: this.state.nativeConfig.radiusMeters, min: 2, max: 10, step: 1 })
               .onChange((value: number) => this.controller.setTaskSettings(value, this.state.nativeConfig.framing,

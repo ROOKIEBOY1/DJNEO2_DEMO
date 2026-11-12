@@ -10,7 +10,7 @@ import { axesForMovement, buildStickPayload, INITIAL_PAYLOAD, StickAxes } from '
 import { VideoAssembler, VideoAssemblerSnapshot } from '../media/VideoAssembler';
 import { DroneUdpChannel, DroneWifiSelection } from '../platform/DroneUdpChannel';
 import { CancellationToken, ErrorLayer, failure, OperationResult, success } from './OperationResult';
-import { TelemetrySnapshot, TelemetryStore } from './TelemetryStore';
+import { TelemetryObservation, TelemetrySnapshot, TelemetryStore } from './TelemetryStore';
 import { RegistrationExchange, RegistrationSnapshot } from '../transport/RegistrationExchange';
 import { ReliableTransport, ReliableTransportSnapshot } from '../transport/ReliableTransport';
 import { resequenceTunnels, RoutingSequenceSnapshot, RoutingSequenceStore } from '../transport/RoutingSequenceStore';
@@ -84,6 +84,7 @@ export interface DroneSessionSnapshot {
 export type SessionListener = (snapshot: DroneSessionSnapshot) => void;
 export type VideoFrameListener = (frame: Uint8Array) => void;
 export type CameraTelemetryListener = () => void;
+export type TaskTelemetryListener = (observation: TelemetryObservation) => void;
 export type Channel3Handler = (packet: Uint8Array) => void;
 
 export class DroneSession {
@@ -121,6 +122,11 @@ export class DroneSession {
   private listener?: SessionListener;
   private videoListener?: VideoFrameListener;
   private cameraTelemetryListener?: CameraTelemetryListener;
+  private taskTelemetryListener?: TaskTelemetryListener;
+  private taskObserverErrors: number = 0;
+  private lastTaskPayloadLog: string = '';
+  private lastNavigationPayloadLog: string = '';
+  private lastExceptionCodeLog?: number;
   private lastCameraStateLog: string = '';
   private cameraObserverErrors: number = 0;
   private channel3Handler?: Channel3Handler;
@@ -148,6 +154,10 @@ export class DroneSession {
 
   setCameraTelemetryListener(listener?: CameraTelemetryListener): void {
     this.cameraTelemetryListener = listener;
+  }
+
+  setTaskTelemetryListener(listener?: TaskTelemetryListener): void {
+    this.taskTelemetryListener = listener;
   }
 
   setChannel3Handler(handler?: Channel3Handler): void {
@@ -228,6 +238,8 @@ export class DroneSession {
       this.sessionMismatches = 0;
       this.replyDiagnosticsLogged = 0;
       this.lastCameraStateLog = ''; this.cameraObserverErrors = 0;
+      this.lastTaskPayloadLog = ''; this.lastExceptionCodeLog = undefined; this.taskObserverErrors = 0;
+      this.lastNavigationPayloadLog = '';
       this.phaseValue = SessionPhase.HANDSHAKING;
       this.emit();
       const packetHandler = (packet: Uint8Array, receivedAtMs: number): void => {
@@ -747,7 +759,37 @@ export class DroneSession {
       if (this.generation !== packetGeneration) return;
       const message = messages[index];
       this.registration?.observe(message);
-      const camera = this.telemetry.observe(message, receivedAtMs);
+      const observation = this.telemetry.observeEvent(message, receivedAtMs);
+      if (observation.task !== undefined || observation.taskException !== undefined ||
+        observation.navigation !== undefined || observation.flight !== undefined) {
+        const task = observation.task;
+        const exception = observation.taskException;
+        const navigation = observation.navigation;
+        if (navigation !== undefined && navigation.payloadHex !== this.lastNavigationPayloadLog) {
+          this.lastNavigationPayloadLog = navigation.payloadHex;
+          hilog.info(LOG_DOMAIN, LOG_TAG, 'navigation 0A/5A generation=%{public}d at=%{public}d payload=%{public}s',
+            packetGeneration, receivedAtMs, navigation.payloadHex);
+        }
+        if (task !== undefined && task.payloadHex !== this.lastTaskPayloadLog) {
+          this.lastTaskPayloadLog = task.payloadHex;
+          hilog.info(LOG_DOMAIN, LOG_TAG, 'task event generation=%{public}d at=%{public}d payload=%{public}s',
+            packetGeneration, receivedAtMs, task.payloadHex);
+        }
+        if (exception !== undefined && exception.codeRaw !== this.lastExceptionCodeLog) {
+          this.lastExceptionCodeLog = exception.codeRaw;
+          hilog.info(LOG_DOMAIN, LOG_TAG,
+            'task exception 0A/39 generation=%{public}d at=%{public}d sequence=%{public}d code=%{public}d payload=%{public}s',
+            packetGeneration, receivedAtMs, exception.sequence, exception.codeRaw, exception.payloadHex);
+        }
+        try { this.taskTelemetryListener?.(observation); }
+        catch (error) {
+          this.taskObserverErrors++;
+          if (this.taskObserverErrors <= 5) hilog.error(LOG_DOMAIN, LOG_TAG,
+            'task observer failed count=%{public}d error=%{public}s', this.taskObserverErrors, errorMessage(error));
+        }
+        if (this.generation !== packetGeneration) return;
+      }
+      const camera = observation.camera;
       if (camera !== undefined) {
         const state = `${camera.modeRaw}/${camera.recordStateRaw}/${camera.timeSynchronized}`;
         if (state !== this.lastCameraStateLog) {

@@ -1,4 +1,5 @@
 import { NativeTaskConfig, NativeTaskService, NativeTaskSnapshot } from './NativeTaskService';
+import { TelemetryObservation } from './TelemetryStore';
 import { DollyFraming, NativeTaskKind } from '../protocol/NativeTaskCodec';
 import { VoiceMotion } from './VoiceMotion';
 import * as nativeVideo from 'libneovideo.so';
@@ -220,6 +221,7 @@ export class AppController {
     });
     this.session.setVideoFrameListener((frame: Uint8Array) => this.video.submit(frame));
     this.session.setCameraTelemetryListener((): void => this.observeShootingTelemetry());
+    this.session.setTaskTelemetryListener((observation: TelemetryObservation): void => this.observeTaskTelemetry(observation));
     this.session.setListener((state: DroneSessionSnapshot) => {
       this.video.setSession(this.videoSessionEnabled ? videoSessionIdentity(state.phase, state.sessionHex) : '');
       this.pollVideoKeyframeRecovery();
@@ -1194,11 +1196,39 @@ export class AppController {
     return `最新${kind === 'photo' ? '照片' : '录像'}已取回`;
   }
 
+  recordTaskStopNotice(id: string, message: string): void {
+    this.log(`任务停止提示已请求：标识=${id}，内容=${message}`);
+  }
+
+  private observeTaskTelemetry(observation: TelemetryObservation): void {
+    if (!this.videoSessionEnabled || this.session.snapshot().phase !== 'ready') return;
+    this.nativeTasks.observeTelemetry(observation);
+    const exception = observation.taskException;
+    if (exception !== undefined && exception.codeRaw !== 0) {
+      const session = this.session.snapshot();
+      const telemetry = session.telemetry;
+      const native = this.nativeTasks.snapshot();
+      this.log(`运镜异常回报：会话=${session.generation}/${session.sessionHex}，` +
+        `接收时间=${exception.observedAtMs}，序号=${exception.sequence}，0A/39原始码=${exception.codeRaw}，` +
+        `负载=${exception.payloadHex}，本轮启动=${native.startedAtMs ?? '无'}，任务=${native.kind}/${telemetry.task?.payloadHex ?? '无'}，` +
+        `执行/录像已观察=${native.executionSeen}/${native.recordingSeen}，` +
+        `飞行=${telemetry.flight?.modeRaw ?? '无'}/${telemetry.flight?.airborne ?? '无'}/${telemetry.flight?.motorsOn ?? '无'}，` +
+        `速度=${telemetry.flight?.velocityXMetersPerSecond ?? '无'}/${telemetry.flight?.velocityYMetersPerSecond ?? '无'}/${telemetry.flight?.velocityZMetersPerSecond ?? '无'}，` +
+        `导航=${JSON.stringify(telemetry.navigation) ?? '无'}，动作中=${exception.inAction}，` +
+        `相机=${telemetry.camera?.modeRaw ?? '无'}/${telemetry.camera?.recordStateRaw ?? '无'}，` +
+        `跟踪=${telemetry.subject?.tracking === true}/${trackedSubjectId(telemetry.subject) ?? '无'}，` +
+        `关联=${JSON.stringify(native.stopReport) ?? '等待终态'}`);
+    }
+  }
+
   private observeShootingTelemetry(): void {
     if (!this.videoSessionEnabled || this.session.snapshot().phase !== 'ready') return;
     const telemetry = this.session.snapshot().telemetry;
     // Each sink records local evidence only. Keep UI emission, downloads and
     // aircraft operations outside the synchronous receive callback.
+    try {
+      if (telemetry.camera !== undefined) this.nativeTasks.observeCameraTelemetry(telemetry.camera);
+    } catch (error) { this.log(`停止提示观察异常：${asError(error).message}`); }
     try {
       const progress = this.nativeTasks.observeProgress();
       if (progress !== undefined) this.log(progress);

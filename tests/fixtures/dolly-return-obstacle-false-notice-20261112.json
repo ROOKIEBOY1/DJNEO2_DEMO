@@ -1,0 +1,8 @@
+{
+  "source": "USB hilog, PID 21475, 2026-11-12; no independent popup timestamp was logged",
+  "runs": [
+    {"startedAtMs":1794449561337,"executionAtMs":1794449561420,"exceptionAtMs":1794449576477,"sequence":2267,"payload":"0000000000002f000b00","firstTerminalAtMs":1794449576530,"cameraIdleAtMs":1794449575166,"returnModeAtMs":1794449576779,"trackingModeAtMs":1794449584183,"circleExecutionAtMs":1794449586495},
+    {"startedAtMs":1794449660473,"executionAtMs":1794449660556,"exceptionAtMs":1794449673698,"sequence":28078,"payload":"0000000000002b000b00","firstTerminalAtMs":1794449673749,"cameraIdleAtMs":1794449674752,"returnModeAtMs":1794449674047,"trackingModeAtMs":1794449679232,"circleExecutionAtMs":1794449681423},
+    {"startedAtMs":1794449730326,"executionAtMs":1794449730400,"exceptionAtMs":1794449741739,"sequence":48852,"payload":"00000000000022000b00","firstTerminalAtMs":1794449741793,"cameraIdleAtMs":1794449742895,"returnModeAtMs":1794449741996,"trackingModeAtMs":1794449746926,"circleExecutionAtMs":1794449749274}
+  ]
+}

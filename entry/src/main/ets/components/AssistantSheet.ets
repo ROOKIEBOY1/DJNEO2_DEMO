@@ -309,6 +309,10 @@ export struct AssistantSheet {
         }.width('100%')
         Text(assistantProgress(this.state, this.status).detail).fontSize(12).fontColor('#8B949C').lineHeight(19).width('100%')
       }.width('100%').alignItems(HorizontalAlign.Start)
+      if (this.state.nativeTask.stopNotice !== undefined) {
+        Text(this.state.nativeTask.stopNotice.message).fontSize(13).fontColor('#B54708')
+          .lineHeight(20).width('100%').padding(10).backgroundColor('#FFF4E5').borderRadius(10)
+      }
       Stack() {
         XComponent({ id: 'neoAssistantVideo', type: XComponentType.SURFACE, controller: this.surface })
           .width('100%').height('100%').hitTestBehavior(HitTestMode.None)
