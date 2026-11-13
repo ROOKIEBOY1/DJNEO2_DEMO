@@ -36,6 +36,7 @@ export interface AgentAction {
   seconds?: number;
   steps?: MovementStep[];
   message?: string;
+  selectionStatus?: 'not_found' | 'ambiguous';
 }
 
 export interface AgentContext {
@@ -113,12 +114,16 @@ export function validateAgentAction(command: AgentAction, observation: AgentObse
     case 'circle': fields = ['radiusMeters', 'subjectId']; break;
     case 'move': fields = ['direction', 'seconds']; break;
     case 'move_sequence': fields = ['steps']; break;
-    case 'none': fields = ['message']; break;
+    case 'none': fields = observation.purpose === 'subject_selection' ? ['message', 'selectionStatus'] : ['message']; break;
     case 'cancel_subject': case 'record_stop':
     case 'download_photo': case 'download_video': case 'stop': case 'takeoff': case 'land': break;
     default: throw new Error('不支持的动作');
   }
   if (Object.keys(command).some(key => key !== 'action' && !fields.includes(key))) throw new Error('动作包含无效参数');
+  if (Object.keys(command).includes('selectionStatus') &&
+    command.selectionStatus !== 'not_found' && command.selectionStatus !== 'ambiguous') {
+    throw new Error('选人结果状态无效');
+  }
   if (command.action === 'move_sequence') validateMovementSteps(command.steps);
   if (command.subjectRequired !== undefined && typeof command.subjectRequired !== 'boolean') throw new Error('主体选择参数无效');
   if (observation.purpose === 'subject_selection' && command.subjectRequired !== undefined) {

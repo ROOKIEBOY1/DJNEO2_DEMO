@@ -32,10 +32,10 @@ export class CloudVlmClient {
     }
   }
 
-  async request(observation: AgentObservation, description: string, isCurrent: () => boolean): Promise<AgentResponse> {
+  async request(observation: AgentObservation, description: string, isCurrent: () => boolean, deadlineMs?: number): Promise<AgentResponse> {
     if (this.busy) throw new Error('已有云端请求处理中，请稍候');
     this.busy = true;
-    const deadline = observation.requestedAtMs + agentObservationTimeoutMs(observation);
+    const deadline = Math.min(observation.requestedAtMs + agentObservationTimeoutMs(observation), deadlineMs ?? Infinity);
     const started = Date.now();
     try {
       if (!isCurrent()) throw new Error('云端请求已取消或飞机会话发生变化');

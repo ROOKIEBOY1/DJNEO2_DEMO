@@ -76,7 +76,7 @@ test('a progress observer cannot mutate the step that will be sent',async()=>{
 
 test('the optional flight context guard blocks before send and centers promptly if context changes mid-step',async()=>{
   let now=0,allowed=false;const events=[];
-  const flight=new FlightCommandService({isActionLinkFresh:()=>true,
+  const flight=new FlightCommandService({sessionId:()=>1,isActionLinkFresh:()=>true,
     requestFlight:async()=>Uint8Array.of(0),setMovementAxes:axes=>events.push(['axes',axes,now]),
     centerSticks:async()=>events.push(['center',now])});
   await flight.takeoff(true);const token=flight.newCancellationToken();

@@ -33,6 +33,9 @@ import { AircraftProfileStore, AircraftProfileSummary } from '../profile/Aircraf
 import { NeoWifiLink } from '../platform/NeoWifiLink';
 import { SubjectBox, selectedSubjectOverlay } from './SubjectObservation';
 import { SubjectTaskWorkflow, SubjectTaskSnapshot, SubjectTaskPort } from './SubjectTaskWorkflow';
+import { AutoSubjectSearch, SubjectSearchResult } from './AutoSubjectSearch';
+import { SEARCH_PICTURE_WAIT_MS, searchPictureNeedsRecovery, SubjectSearchFrameUnavailable,
+  SubjectSearchPictureStability } from './SubjectSearchPicture';
 import { normalizeDroneUtterance } from './VoiceUtterance';
 import { CloseupSequence, CloseupSequenceSnapshot, CloseupSequencePort } from './CloseupSequence';
 import { CloseupMediaGroup } from '../media/CloseupMediaGroup';
@@ -159,6 +162,9 @@ export class AppController {
   private vlmFramePending: boolean = false;
   private agentGeneration: number = 0;
   private movementSequenceToken?: CancellationToken;
+  private subjectSearch?: AutoSubjectSearch;
+  private subjectSearchToken?: CancellationToken;
+  private subjectSearchPictureRevision: number = 0;
   private agentRequestSequence: number = 0;
   private latestAgentRequestId: string = '';
   private acceptedAgentRequestId: string = '';
@@ -716,6 +722,7 @@ export class AppController {
   }
 
   private async pollAutoSubjectScan(): Promise<void> {
+    if (this.subjectSearch?.snapshot().active === true) return;
     const flight = this.flight.snapshot();
     if (this.autoScanGeneration !== flight.generation) {
       this.autoScanGeneration = flight.generation;
@@ -816,11 +823,12 @@ export class AppController {
     await this.run<string>('开始主体扫描', (token: CancellationToken) => this.requestHoverSubjectScan(token));
   }
 
-  private async requestHoverSubjectScan(token: CancellationToken, restart: boolean = false): Promise<OperationResult<string>> {
+  private async requestHoverSubjectScan(token: CancellationToken, restart: boolean = false,
+    operationDeadlineMs?: number): Promise<OperationResult<string>> {
       if (this.hoverScanAttempted && !restart) {
         return failure<string>(ErrorLayer.TASK, 'SUBJECT_SCAN_ALREADY_ATTEMPTED', '本次连接已发送过扫描请求，请查看候选列表');
       }
-      const deadline = Date.now() + 2000;
+      const deadline = Math.min(Date.now() + 2000, operationDeadlineMs ?? Infinity);
       let manualTask = false;
       while (true) {
         if (token.isCancelled()) {
@@ -839,15 +847,19 @@ export class AppController {
         if (Date.now() >= deadline) break;
         await new Promise<void>((resolve: () => void) => setTimeout(resolve, 100));
       }
+      if (operationDeadlineMs !== undefined && Date.now() >= operationDeadlineMs) {
+        return failure<string>(ErrorLayer.TASK, 'SUBJECT_SCAN_TIMEOUT', '自动寻人已达到总时限');
+      }
       this.hoverScanAttempted = true;
       if (manualTask || restart) {
         const requested = Date.now();
         const sessionId = this.session.sessionId();
-        const stopped = await this.session.requestNative(0x92, 0x23, 0x15, new Uint8Array(0), 1000, token);
+        const stopped = await this.session.requestNative(0x92, 0x23, 0x15, new Uint8Array(0),
+          Math.min(1000, (operationDeadlineMs ?? Infinity) - Date.now()), token);
         if (token.isCancelled() || stopped === undefined || stopped.length !== 1 || stopped[0] !== 0) {
           return failure<string>(ErrorLayer.TASK, 'SUBJECT_STOP_UNCONFIRMED', '飞机未确认进入可选人状态');
         }
-        const scanDeadline = Date.now() + 4000;
+        const scanDeadline = Math.min(Date.now() + 4000, operationDeadlineMs ?? Infinity);
         while (!token.isCancelled() && this.session.sessionId() === sessionId && Date.now() < scanDeadline) {
           const state = this.session.snapshot();
           const task = state.telemetry.task;
@@ -860,7 +872,8 @@ export class AppController {
         }
         return failure<string>(ErrorLayer.TASK, 'SUBJECT_SCAN_UNCONFIRMED', '未收到任务空闲和扫描开启回报，暂不能选人');
       }
-      const reply = await this.session.requestNative(0x92, 0x0a, 0xba, new Uint8Array([1, 3, 0]), 1000, token);
+      const reply = await this.session.requestNative(0x92, 0x0a, 0xba, new Uint8Array([1, 3, 0]),
+        Math.min(1000, (operationDeadlineMs ?? Infinity) - Date.now()), token);
       if (token.isCancelled()) return failure<string>(ErrorLayer.TASK, 'SUBJECT_CANCELLED', '主体扫描已取消');
       if (reply === undefined || reply.length !== 1 || reply[0] !== 0) {
         return failure<string>(ErrorLayer.TASK, 'SUBJECT_SCAN_UNCONFIRMED', '飞机未确认扫描请求，请查看后续候选回传');
@@ -892,7 +905,8 @@ export class AppController {
     if (selectionError.length > 0) throw new Error(selectionError);
   }
 
-  private async requestSubjectSelection(token: CancellationToken, targetId?: number): Promise<OperationResult<string>> {
+  private async requestSubjectSelection(token: CancellationToken, targetId?: number,
+    operationDeadlineMs?: number): Promise<OperationResult<string>> {
       const state = this.session.snapshot();
       const telemetry = state.telemetry;
       const subject = telemetry.subject;
@@ -910,6 +924,9 @@ export class AppController {
         return failure<string>(ErrorLayer.TASK, 'SUBJECT_CONTEXT', '需要新鲜连接，且任务空闲或已开启普通悬停扫描');
       }
       const requested = Date.now();
+      if (operationDeadlineMs !== undefined && requested >= operationDeadlineMs) {
+        return failure<string>(ErrorLayer.TASK, 'SUBJECT_SELECTION_TIMEOUT', '自动寻人已达到总时限');
+      }
       if (targetId !== undefined && (!Number.isInteger(targetId) || targetId < 0 || targetId > 255 ||
         subject === undefined || subject.detectionAt === undefined || requested - subject.detectionAt > 500 ||
         !subject.candidates.some(candidate => candidate.id === targetId))) {
@@ -917,7 +934,8 @@ export class AppController {
       }
       const payload = targetId === undefined ? new Uint8Array([1, 3, 0]) : new Uint8Array([1, 5, targetId]);
       this.selectedSubjectId = undefined;
-      const reply = await this.session.requestNative(0x92, 0x0a, 0xba, payload, 1000, token);
+      const reply = await this.session.requestNative(0x92, 0x0a, 0xba, payload,
+        Math.min(1000, (operationDeadlineMs ?? Infinity) - Date.now()), token);
       if (token.isCancelled()) return failure<string>(ErrorLayer.TASK, 'SUBJECT_CANCELLED', '主体操作已取消');
       if (reply === undefined || reply.length !== 1 || reply[0] !== 0) {
         return failure<string>(ErrorLayer.TASK, 'SUBJECT_UNCONFIRMED', '飞机未确认主体操作');
@@ -1249,7 +1267,7 @@ export class AppController {
     if ((flight.landRequested || flight.landSent) && ((telemetry.flightAgeMs ?? Infinity) > 1000 ||
       telemetry.flight?.airborne !== false || telemetry.flight?.motorsOn !== false)) return;
     const planning = this.latestAgentRequestId.length > 0 && this.latestAgentRequestId !== this.acceptedAgentRequestId;
-    if (kind === undefined || this.busyValue || taskActive || planning || this.pendingAgentAction !== undefined ||
+    if (kind === undefined || this.busyValue || taskActive || planning || this.subjectSearch?.snapshot().active === true || this.pendingAgentAction !== undefined ||
       this.vlmFramePending || this.speech.isListeningOnce() || this.camera.snapshot().operationActive) return;
     await this.run('自动取回本次素材', async (token: CancellationToken) => {
       try { return success(await this.retrieveCapture(kind, token)); }
@@ -1270,7 +1288,8 @@ export class AppController {
     this.emit();
   }
 
-  async captureAgentObservation(waitForScan: boolean = true, frameDeadlineMs?: number): Promise<AgentObservation> {
+  async captureAgentObservation(waitForScan: boolean = true, frameDeadlineMs?: number,
+    minCapturedAtMs?: number, checkCurrent?: () => void): Promise<AgentObservation> {
     const sessionId = this.session.sessionId();
     const generation = this.flight.snapshot().generation;
     const controlGeneration = this.agentGeneration;
@@ -1278,8 +1297,14 @@ export class AppController {
     if (waitForScan) await this.waitForAutomaticSubjectScan();
     let frame: VlmFrame | undefined;
     if (this.video.snapshot().state === 'live') {
-      try { frame = await this.captureVlmFrame(frameDeadlineMs); }
-      catch (error) { this.log(`动作请求未附图像：${asError(error).message}`); }
+      try { frame = await this.captureVlmFrame(frameDeadlineMs, minCapturedAtMs, checkCurrent); }
+      catch (error) {
+        this.log(`动作请求未附图像：${asError(error).message}`);
+        if (minCapturedAtMs !== undefined) throw error as Error;
+      }
+    } else if (minCapturedAtMs !== undefined) {
+      checkCurrent?.();
+      throw new SubjectSearchFrameUnavailable('decoder_unready', '寻人画面暂未就绪，等待恢复');
     }
     if (sessionId !== this.session.sessionId() || generation !== this.flight.snapshot().generation ||
       controlGeneration !== this.agentGeneration || !this.session.isReliableLinkFresh()) {
@@ -1368,6 +1393,7 @@ export class AppController {
   }
 
   cancelAgentAction(): void {
+    this.subjectSearchToken?.cancel(); this.subjectSearch?.cancel();
     this.movementSequenceToken?.cancel();
     this.captureRecoveryToken?.cancel();
     this.nativeTasks?.cancel();
@@ -1547,6 +1573,7 @@ export class AppController {
   }
 
   async runCloudVoiceRequest(description: string): Promise<AgentOutcome> {
+    await this.interruptSubjectSearchForControl();
     if (this.closeupSequence?.snapshot().active !== true) this.retireCloseup();
     const normalized = normalizeDroneUtterance(description);
     if (normalized !== description) this.log('已纠正语音中的希区柯克同音词，保留原始用户消息');
@@ -1673,7 +1700,7 @@ export class AppController {
     if (!recovered) throw new Error(recoveryError);
   }
 
-  private ensureDollyHoverReady(allowCompleted: boolean = false): void {
+  private ensureDollyHoverReady(allowCompleted: boolean = false, allowVideoWait: boolean = false): void {
     const state = this.session.snapshot();
     const telemetry = state.telemetry;
     const flight = this.flight.snapshot();
@@ -1682,8 +1709,8 @@ export class AppController {
       throw new Error('当前操作尚未结束，请稍后再拍摄');
     }
     if (state.phase !== 'ready' || !state.deviceVerified || !this.session.isReliableLinkFresh() ||
-      (state.downlinkAgeMs ?? Infinity) > 1000 || (state.videoAgeMs ?? Infinity) > 1000 ||
-      this.video.snapshot().state !== 'live') throw new Error('实时画面或飞机连接尚未就绪，请稍后再拍摄');
+      (state.downlinkAgeMs ?? Infinity) > 1000 || (!allowVideoWait && ((state.videoAgeMs ?? Infinity) > 1000 ||
+      this.video.snapshot().state !== 'live'))) throw new Error('实时画面或飞机连接尚未就绪，请稍后再拍摄');
     if (!flight.takeoffSent || !flight.takeoffAcknowledged || flight.movementActive || flight.landRequested || flight.landSent ||
       (telemetry.flightAgeMs ?? Infinity) > 1000 || telemetry.flight?.airborne !== true ||
       telemetry.flight.motorsOn !== true || ![6, 26].includes(telemetry.flight.modeRaw)) {
@@ -1707,6 +1734,237 @@ export class AppController {
         throw new Error('当前主体跟踪尚未稳定，请等待新画面后重试');
       }
     }
+  }
+
+  private async interruptSubjectSearchForControl(): Promise<void> {
+    if (this.subjectSearch?.snapshot().active !== true) return;
+    this.cancelAgentAction();
+    if (this.flight.snapshot().movementActive) {
+      agentResult(await this.flight.centerSticks());
+      const deadline = Date.now() + 1000;
+      while (this.flight.snapshot().movementActive && Date.now() < deadline) {
+        await new Promise<void>((resolve: () => void) => setTimeout(resolve, 25));
+      }
+      if (this.flight.snapshot().movementActive) throw new Error('寻人自转尚未结束，请稍后重试');
+    }
+  }
+
+  private ensureSubjectSearchCurrent(check: () => void, deadlineMs: number, rotating: boolean = false,
+    allowVideoWait: boolean = false): void {
+    check();
+    if (Date.now() >= deadlineMs) throw new Error('自动寻人已达到总时限，未开始拍摄');
+    if (!rotating) { this.ensureDollyHoverReady(false, allowVideoWait); return; }
+    const flight = this.flight.snapshot();
+    const state = this.session.snapshot();
+    const telemetry = state.telemetry;
+    if (this.busyValue || !this.session.isActionLinkFresh() || !flight.takeoffAcknowledged ||
+      flight.nativeTaskMayFly || flight.landRequested || flight.landSent || this.nativeTasks.activeOrUnknown() ||
+      (telemetry.flightAgeMs ?? Infinity) > 1000 || telemetry.flight?.modeRaw !== 6 ||
+      telemetry.flight.airborne !== true || telemetry.flight.motorsOn !== true ||
+      (telemetry.taskAgeMs ?? Infinity) > 1000 || telemetry.task === undefined ||
+      !((telemetry.task.phaseRaw === 0 && telemetry.task.modeRaw === 0) ||
+        ([0, 5].includes(telemetry.task.phaseRaw) && telemetry.task.modeRaw === 9)) ||
+      (telemetry.cameraAgeMs ?? Infinity) > 1000 || telemetry.camera?.recordingCandidate !== false ||
+      this.camera.snapshot().recordingRequested || this.camera.snapshot().operationActive ||
+      this.video.snapshot().state !== 'live' || this.video.snapshot().stats?.waitingForKey === true) {
+      throw new Error('自动寻人的悬停、任务、相机或图传状态已变化');
+    }
+  }
+
+  private async waitForSubjectSearchPicture(check: () => void, deadlineMs: number, force: boolean = false): Promise<boolean> {
+    this.ensureSubjectSearchCurrent(check, Infinity, false, true);
+    if (Date.now() >= deadlineMs) throw new Error('等待寻人画面恢复超时，已保持悬停并停止搜索');
+    if (!force && !searchPictureNeedsRecovery(this.video.snapshot())) return false;
+    const started = Date.now();
+    const deadline = Math.min(deadlineMs, started + SEARCH_PICTURE_WAIT_MS);
+    const stable = new SubjectSearchPictureStability();
+    this.agentFeedback = '寻人已暂停转向，正在等待实时画面恢复…';
+    this.autoScanMessage = this.agentFeedback;
+    this.log(`自动寻人画面：进入恢复等待，截止=${deadline}，转向次数=${this.subjectSearch?.snapshot().turns ?? 0}`);
+    this.emit();
+    while (Date.now() < deadline) {
+      this.ensureSubjectSearchCurrent(check, deadlineMs, false, true);
+      const preview = this.video.snapshot();
+      if (preview.stats?.recoveryPaused === true || preview.stats?.running === false || preview.state === 'stopped') {
+        throw new Error('图传自动恢复已暂停或预览已关闭，请恢复画面后重新寻人');
+      }
+      this.pollVideoKeyframeRecovery();
+      if (stable.observe(this.video.snapshot(), Date.now())) {
+        this.ensureSubjectSearchCurrent(check, deadlineMs, false, true);
+        this.subjectSearchPictureRevision = (this.subjectSearchPictureRevision ?? 0) + 1;
+        this.log(`自动寻人画面：已恢复稳定新输出，等待=${Date.now() - started}ms，解码轮次=${this.video.snapshot().stats?.decoderEpoch ?? '无'}`);
+        this.agentFeedback = '实时画面已恢复，继续寻找同一目标…'; this.autoScanMessage = this.agentFeedback; this.emit();
+        return true;
+      }
+      await new Promise<void>((resolve: () => void) => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))));
+    }
+    this.ensureSubjectSearchCurrent(check, Infinity, false, true);
+    throw new Error('等待寻人画面恢复超时，已保持悬停并停止搜索');
+  }
+
+  private async settleSubjectSearch(check: () => void, deadlineMs: number): Promise<number> {
+    let since = Date.now();
+    let deadline = Math.min(deadlineMs, since + 5000);
+    while (Date.now() < deadline) {
+      if (await this.waitForSubjectSearchPicture(check, deadlineMs)) {
+        since = Date.now(); deadline = Math.min(deadlineMs, since + 5000);
+      }
+      this.ensureSubjectSearchCurrent(check, deadlineMs);
+      const telemetry = this.session.snapshot().telemetry;
+      if (Date.now() - since >= 500 && (telemetry.flight?.observedAtMs ?? -1) >= since &&
+        (telemetry.task?.observedAtMs ?? -1) >= since && (telemetry.camera?.observedAtMs ?? -1) >= since &&
+        (telemetry.subject?.detectionAt ?? -1) >= since) return Date.now();
+      await new Promise<void>((resolve: () => void) => setTimeout(resolve, 50));
+    }
+    check();
+    throw new Error('寻人转向后未确认稳定的新鲜画面，已停止搜索');
+  }
+
+  private async turnForSubjectSearch(seconds: number, check: () => void, deadlineMs: number): Promise<void> {
+    this.ensureSubjectSearchCurrent(check, deadlineMs);
+    const token = this.flight.newCancellationToken(); this.subjectSearchToken = token;
+    try {
+      if (this.session.snapshot().telemetry.subject?.tracking === true ||
+        this.session.snapshot().telemetry.flight?.modeRaw === 26) {
+        agentResult(await this.requestSubjectSelection(token, undefined, deadlineMs));
+        const releaseDeadline = Math.min(deadlineMs, Date.now() + 4000);
+        while (Date.now() < releaseDeadline) {
+          check();
+          if (token.isCancelled()) throw new Error('自动寻人已取消');
+          const state = this.session.snapshot();
+          if (this.isOrdinarySubjectHover(state, this.flight.snapshot()) && state.telemetry.subject?.tracking !== true) break;
+          await new Promise<void>((resolve: () => void) => setTimeout(resolve, 50));
+        }
+        check();
+        if (!this.isOrdinarySubjectHover(this.session.snapshot(), this.flight.snapshot())) {
+          throw new Error('退出跟踪后尚未恢复普通悬停，未继续自转');
+        }
+      }
+      const state = this.session.snapshot();
+      if (state.telemetry.task?.modeRaw === 9 || state.telemetry.subject?.scanStateRaw !== 1) {
+        agentResult(await this.requestHoverSubjectScan(token, true, deadlineMs));
+      }
+      this.ensureSubjectSearchCurrent(check, deadlineMs, true);
+      if (token.isCancelled() || Date.now() + seconds * 1000 >= deadlineMs) throw new Error('自动寻人已取消或达到总时限');
+      const moved = await this.flight.move('turn_left', seconds, token, (): boolean => {
+        try { this.ensureSubjectSearchCurrent(check, deadlineMs, true); return !token.isCancelled(); }
+        catch (_) { return false; }
+      });
+      if (!moved.ok && ['MOVEMENT_CONTEXT_CHANGED', 'MOVEMENT_LINK_LOST'].includes(moved.error?.code ?? '')) {
+        this.ensureSubjectSearchCurrent(check, deadlineMs, false, true);
+        if (searchPictureNeedsRecovery(this.video.snapshot())) {
+          this.log('自动寻人画面：转向期间画面失效，已回中，等待恢复后继续观察');
+          await this.waitForSubjectSearchPicture(check, deadlineMs, true);
+          return;
+        }
+      }
+      agentResult(moved);
+      check();
+    } finally {
+      if (this.subjectSearchToken === token) this.subjectSearchToken = undefined;
+    }
+  }
+
+  private async findSubjectForTask(text: string, ground: AgentObservation, entry: 'ground' | 'hover',
+    inferred: AgentAction | undefined, check: () => void): Promise<AgentAction> {
+    let selectedObservation: AgentObservation | undefined;
+    let firstView = true;
+    let settledAt = Date.now();
+    const initialPictureRevision = this.subjectSearchPictureRevision ?? 0;
+    const search = new AutoSubjectSearch((): void => {
+      const progress = this.subjectSearch?.snapshot();
+      if (this.subjectSearch !== search || progress === undefined) return;
+      this.agentFeedback = progress.message; this.autoScanMessage = progress.message;
+      this.log(`自动寻人：阶段=${progress.stage}，自转次数=${progress.turns}，${progress.message}`);
+      this.emit();
+    });
+    this.subjectSearch = search;
+    const id = await search.find({
+      isCurrent: (): boolean => { try { check(); return true; } catch (_) { return false; } },
+      settle: async (deadline: number): Promise<void> => { settledAt = await this.settleSubjectSearch(check, deadline); },
+      turn: (seconds: number, deadline: number): Promise<void> => this.turnForSubjectSearch(seconds, check, deadline),
+      inspect: async (deadline: number): Promise<SubjectSearchResult> => {
+        let pictureDeadline: number | undefined;
+        while (true) {
+        this.ensureSubjectSearchCurrent(check, deadline, false, true);
+        if (searchPictureNeedsRecovery(this.video.snapshot())) {
+          firstView = false;
+          pictureDeadline = pictureDeadline ?? Math.min(deadline, Date.now() + SEARCH_PICTURE_WAIT_MS);
+          await this.waitForSubjectSearchPicture(check, pictureDeadline, true);
+          settledAt = await this.settleSubjectSearch(check, pictureDeadline);
+        }
+        this.ensureSubjectSearchCurrent(check, deadline);
+        const epoch = this.video.snapshot().stats?.decoderEpoch;
+        let observation: AgentObservation | undefined;
+        try {
+          observation = await this.captureAgentObservation(false, pictureDeadline ?? deadline, settledAt,
+            (): void => this.ensureSubjectSearchCurrent(check, deadline, false, true));
+          this.ensureSubjectSearchCurrent(check, deadline, false, true);
+          if (this.video.snapshot().stats?.decoderEpoch !== epoch || searchPictureNeedsRecovery(this.video.snapshot())) {
+            throw new SubjectSearchFrameUnavailable('decoder_changed', '寻人取帧期间画面已变化，等待新画面');
+          }
+          const frame = observation.frame;
+          this.log(`寻人帧校验：停稳时间=${settledAt}，帧时间=${frame?.capturedAtMs ?? '无'}，` +
+            `帧距停稳=${frame === undefined ? '无' : frame.capturedAtMs - settledAt}ms，候选时间=${frame?.candidatesObservedAtMs ?? '无'}，` +
+            `会话=${observation.sessionId}/${frame?.sessionId ?? '无'}，解码轮次=${epoch ?? '无'}/${this.video.snapshot().stats?.decoderEpoch ?? '无'}`);
+          if (frame === undefined || frame.sessionId !== observation.sessionId ||
+            !Number.isSafeInteger(frame.capturedAtMs) || !Number.isSafeInteger(frame.candidatesObservedAtMs) ||
+            Math.abs(frame.capturedAtMs - frame.candidatesObservedAtMs) > 200 ||
+            frame.capturedAtMs < settledAt || frame.capturedAtMs > Date.now() ||
+            this.video.snapshot().stats?.decoderEpoch !== epoch) throw new Error('寻人未取得本次停稳后的有效新帧');
+          const canReuse = firstView && entry === 'hover' && inferred?.subjectId !== undefined && !isSelfSubjectRequest(text) &&
+            (this.subjectSearchPictureRevision ?? 0) === initialPictureRevision;
+          firstView = false;
+          this.log(`寻人选人样本：画面时间=${frame.capturedAtMs}，候选=${frame.candidates.length}，入口=${entry}`);
+          if (frame.candidates.length === 0) return { status: 'not_found' };
+          observation.purpose = 'subject_selection';
+          let selected: AgentAction;
+          if (canReuse && inferred !== undefined) {
+            this.ensureAgentObservation(ground, inferred);
+            selected = { action: 'select_subject', subjectId: inferred.subjectId };
+            this.log(`复用本次云端选人结果并核对新画面：主体 #${inferred.subjectId}`);
+          } else {
+            selected = (await this.requestCloudAgentAction(observation, text, deadline)).command as AgentAction;
+          }
+          this.ensureSubjectSearchCurrent(check, deadline, false, true);
+          if (this.video.snapshot().stats?.decoderEpoch !== epoch || searchPictureNeedsRecovery(this.video.snapshot())) {
+            throw new SubjectSearchFrameUnavailable('decoder_changed', '寻人识别期间画面已变化，丢弃旧结果后重新观察');
+          }
+          this.ensureAgentObservation(observation, selected);
+          if (selected.action === 'none') return { status: selected.selectionStatus ?? 'ambiguous', message: selected.message };
+          if (selected.action !== 'select_subject' || selected.subjectId === undefined) throw new Error('寻人阶段未返回有效主体');
+          selectedObservation = observation;
+          return { status: 'found', subjectId: selected.subjectId };
+        } catch (error) {
+          if (!(error instanceof SubjectSearchFrameUnavailable)) throw error as Error;
+          this.ensureSubjectSearchCurrent(check, deadline, false, true);
+          firstView = false; selectedObservation = undefined;
+          pictureDeadline = pictureDeadline ?? Math.min(deadline, Date.now() + SEARCH_PICTURE_WAIT_MS);
+          this.log(`自动寻人画面：本轮观察待重取，原因=${error.reason}，截止=${pictureDeadline}`);
+          await this.waitForSubjectSearchPicture(check, pictureDeadline, true);
+          settledAt = await this.settleSubjectSearch(check, pictureDeadline);
+        } finally {
+          if (observation !== undefined) this.finishAgentObservation(observation.requestId);
+        }
+        }
+      }
+    });
+    check(); this.ensureDollyHoverReady();
+    const observation = selectedObservation;
+    const latest = this.session.snapshot().telemetry.subject;
+    const detectionAge = Date.now() - (latest?.detectionAt ?? -Infinity);
+    if (observation === undefined || !latest?.candidates.some((box: SubjectBox): boolean => box.id === id) ||
+      detectionAge < 0 || detectionAge > 500) throw new Error('找到的主体已离开当前画面，请重新寻人');
+    const selected: AgentAction = { action: 'select_subject', subjectId: id };
+    this.ensureAgentObservation(observation, selected);
+    if (entry !== 'hover' || observation.frame?.currentSubjectId !== id || trackedSubjectId(latest) !== id) {
+      await this.performAgentAction(observation, selected);
+    } else {
+      this.selectedSubjectId = id;
+      this.log(`主体 #${id} 仍稳定锁定，免重复发送选人指令`);
+    }
+    check();
+    return selected;
   }
 
   private async startGroundDolly(description: string, intent: AgentAction, ground: AgentObservation,
@@ -1772,6 +2030,10 @@ export class AppController {
           // the fresh state after that barrier, as captureAgentObservation does.
           await this.waitForAutomaticSubjectScan(checkScanning);
           checkScanning();
+          if (this.session.snapshot().telemetry.subject?.candidates.length === 0) {
+            await this.pollAutoSubjectScan();
+            checkScanning();
+          }
           const state = this.session.snapshot();
           const subject = state.telemetry.subject;
           if (entry === 'hover') this.ensureDollyHoverReady();
@@ -1781,7 +2043,7 @@ export class AppController {
           const detectionAge = Date.now() - (subject?.detectionAt ?? 0);
           if (!this.busyValue && (this.isOrdinarySubjectHover(state, this.flight.snapshot()) || trackedHover) &&
             state.telemetry.task?.phaseRaw === 0 && state.telemetry.task.modeRaw === 0 &&
-            subject !== undefined && subject.candidates.length > 0 &&
+            subject !== undefined &&
             detectionAge >= 0 && detectionAge <= 500 && this.video.snapshot().state === 'live') return;
           await this.pollAutoSubjectScan();
           await new Promise<void>((resolve: () => void) => setTimeout(resolve, 100));
@@ -1789,42 +2051,7 @@ export class AppController {
         throw new Error('悬停扫描未找到候选主体，未开始拍摄；请调整站位后重试或降落');
       },
       select: async (text: string, settings: AgentAction): Promise<AgentAction> => {
-        check();
-        const observation = await this.captureAgentObservation();
-        try {
-          check();
-          this.log(`视觉选人样本：画面=${observation.frame === undefined ? '无' : '有'}，` +
-            `候选=${observation.frame?.candidates.length ?? 0}，入口=${entry}`);
-          if (observation.frame === undefined || observation.frame.candidates.length === 0) {
-            throw new Error('没有可用的主体画面，未开始拍摄');
-          }
-          let selected: AgentAction;
-          if (entry === 'hover' && inferred?.subjectId !== undefined && !isSelfSubjectRequest(text)) {
-            // The first airborne inference already saw an image. Recheck its lifetime
-            // and candidate against the fresh frame instead of asking the model twice.
-            this.ensureAgentObservation(ground, inferred);
-            selected = { action: 'select_subject', subjectId: inferred.subjectId };
-            this.log(`复用本次云端选人结果并核对新画面：主体 #${inferred.subjectId}`);
-          } else {
-            observation.purpose = 'subject_selection';
-            const response = await this.requestCloudAgentAction(observation, text);
-            selected = response.command as AgentAction;
-          }
-          check();
-          if (entry === 'hover') this.ensureDollyHoverReady();
-          this.ensureAgentObservation(observation, selected);
-          if (selected.action !== 'select_subject' || selected.subjectId === undefined) return selected;
-          const subject = this.session.snapshot().telemetry.subject;
-          if (entry !== 'hover' || observation.frame.currentSubjectId !== selected.subjectId ||
-            trackedSubjectId(subject) !== selected.subjectId) {
-            await this.performAgentAction(observation, { action: 'select_subject', subjectId: selected.subjectId });
-          } else {
-            this.selectedSubjectId = selected.subjectId;
-            this.log(`主体 #${selected.subjectId} 仍稳定锁定，免重复发送选人指令`);
-          }
-          check();
-          return { action: 'select_subject', subjectId: selected.subjectId };
-        } finally { this.finishAgentObservation(observation.requestId); }
+        return this.findSubjectForTask(text, ground, entry, inferred, check);
       },
       shoot: async (command: AgentAction): Promise<AgentOutcome> => {
         check();
@@ -2241,13 +2468,13 @@ export class AppController {
     this.closeupSequence?.reset(); this.closeupMedia?.clear();
   }
 
-  async requestCloudAgentAction(observation: AgentObservation, description: string): Promise<AgentResponse> {
+  async requestCloudAgentAction(observation: AgentObservation, description: string, deadlineMs?: number): Promise<AgentResponse> {
     await this.initializeCloudVlm();
     const isCurrent = (): boolean => observation.controlGeneration === this.agentGeneration &&
       observation.sessionId === this.session.sessionId() && observation.flightGeneration === this.flight.snapshot().generation &&
       observation.requestId === this.latestAgentRequestId && this.session.snapshot().phase === 'ready';
     const started = Date.now();
-    const response = await this.cloudVlm.request(observation, description, isCurrent);
+    const response = await this.cloudVlm.request(observation, description, isCurrent, deadlineMs);
     if (!isCurrent()) throw new Error('云端请求已取消或飞机会话发生变化');
     this.cloudVlmStatus = `手机直连DeepSeek · ${Date.now() - started}毫秒`; this.emit();
     return response;
@@ -2590,22 +2817,56 @@ export class AppController {
     return { message: agentResult(await this.startNativeWithCapture(token, target, videoSequence)) };
   }
 
-  async captureVlmFrame(frameDeadlineMs?: number): Promise<VlmFrame> {
+  async captureVlmFrame(frameDeadlineMs?: number, minCapturedAtMs?: number, checkCurrent?: () => void): Promise<VlmFrame> {
     if (this.vlmFramePending) throw new Error('已有图传取帧请求正在处理');
-    if (this.video.snapshot().state !== 'live') throw new Error('实时图传尚未就绪');
+    if (this.video.snapshot().state !== 'live') {
+      if (minCapturedAtMs !== undefined) throw new SubjectSearchFrameUnavailable('decoder_unready', '寻人画面暂未就绪，等待恢复');
+      throw new Error('实时图传尚未就绪');
+    }
     const sessionId = this.session.sessionId();
-    const before = this.session.snapshot().telemetry.subject;
+    let before = this.session.snapshot().telemetry.subject;
+    const decoderEpoch = this.video.snapshot().stats?.decoderEpoch;
+    const checkReadback = (): void => {
+      checkCurrent?.();
+      if (this.session.sessionId() !== sessionId || !this.session.isReliableLinkFresh()) throw new Error('取帧期间飞机会话已变化');
+      if (minCapturedAtMs !== undefined && this.video.snapshot().stats?.decoderEpoch !== decoderEpoch) {
+        throw new SubjectSearchFrameUnavailable('decoder_changed', '寻人取帧期间解码器已重置，请重新发起');
+      }
+    };
     this.vlmFramePending = true;
     try {
-      const ticket = nativeVideo.requestFrame();
-      if (ticket === 0) throw new Error('图传解码器尚未就绪');
+      checkReadback();
+      let ticket = nativeVideo.requestFrame();
+      if (ticket === 0) {
+        if (minCapturedAtMs !== undefined) throw new SubjectSearchFrameUnavailable('decoder_unready', '图传解码器尚未就绪');
+        throw new Error('图传解码器尚未就绪');
+      }
       const deadline = Math.min(Date.now() + 600, frameDeadlineMs ?? Infinity);
       while (Date.now() < deadline && this.session.sessionId() === sessionId && this.session.isReliableLinkFresh()) {
+        checkReadback();
         const frame = nativeVideo.takeFrame(ticket);
         if (frame === undefined) {
           const remaining = deadline - Date.now();
           if (remaining > 0) await new Promise<void>((resolve: () => void) => setTimeout(resolve, Math.min(16, remaining)));
           continue;
+        }
+        checkReadback();
+        if (minCapturedAtMs !== undefined) {
+          if (!Number.isSafeInteger(frame.capturedAtMs) || frame.capturedAtMs > Date.now()) {
+            this.log(`寻人取帧拒绝：原因=invalid_frame_time，帧时间=${frame.capturedAtMs}，停稳时间=${minCapturedAtMs}，当前=${Date.now()}`);
+            throw new Error('寻人图像时间无效，请重新取帧');
+          }
+          if (frame.capturedAtMs < minCapturedAtMs) {
+            this.log(`寻人取帧等待新帧：票据=${ticket}，帧时间=${frame.capturedAtMs}，停稳时间=${minCapturedAtMs}，` +
+              `早于停稳=${minCapturedAtMs - frame.capturedAtMs}ms，解码轮次=${decoderEpoch ?? '无'}`);
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) break;
+            before = this.session.snapshot().telemetry.subject;
+            ticket = nativeVideo.requestFrame();
+            if (ticket === 0) throw new SubjectSearchFrameUnavailable('decoder_unready', '图传解码器尚未就绪');
+            await new Promise<void>((resolve: () => void) => setTimeout(resolve, Math.min(16, remaining)));
+            continue;
+          }
         }
         if (frame.rgba.byteLength === 0) throw new Error('设备未提供可读取的解码帧');
         const report = closestFrameSubjects(frame.capturedAtMs, before, this.session.snapshot().telemetry.subject);
@@ -2617,6 +2878,7 @@ export class AppController {
           const packer = image.createImagePacker();
           try {
             const jpeg = await packer.packToData(pixels, { format: 'image/jpeg', quality: 85 });
+            checkReadback();
             if (frameDeadlineMs !== undefined && Date.now() >= frameDeadlineMs) throw new Error('交接取帧已超时');
             if (this.session.sessionId() !== sessionId || !this.session.isReliableLinkFresh()) throw new Error('取帧期间飞机会话已变化');
             return { jpeg: jpeg, width: frame.width, height: frame.height, sessionId: sessionId,
@@ -2625,6 +2887,8 @@ export class AppController {
           } finally { await packer.release(); }
         } finally { await pixels.release(); }
       }
+      checkReadback();
+      if (minCapturedAtMs !== undefined) throw new SubjectSearchFrameUnavailable('readback_timeout', '寻人取帧超时，未等到停稳后的新画面');
       throw new Error('实时图传取帧超时或会话已断开');
     } finally { this.vlmFramePending = false; }
   }
@@ -2879,6 +3143,7 @@ export class AppController {
   }
 
   private cancelOperations(): void {
+    this.subjectSearchToken?.cancel(); this.subjectSearch?.cancel();
     this.closeupSequence?.cancel();
     this.groundDolly?.cancel();
     this.pendingAgentAction = undefined;
@@ -3018,6 +3283,7 @@ export class AppController {
 
   private async run<T>(name: string, operation: (token: CancellationToken) => Promise<OperationResult<T>>,
     rejectWhenBusy: boolean = true): Promise<void> {
+    await this.interruptSubjectSearchForControl();
     if ((this.busyValue || (this.connectionAttempt !== undefined && !['连接', '初始化'].includes(name))) && rejectWhenBusy) {
       this.log(`${name}: 已有操作执行中`);
       this.emit();

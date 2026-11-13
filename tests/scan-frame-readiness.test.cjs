@@ -26,7 +26,8 @@ function fixture({temporaryCandidate=true,deliverCandidates=true,landAfterScanRe
       payloadHex:taskMode===9?'0500000900':airborne?'0000000102':'0000000100',observedAtMs:Date.now()},
     cameraAgeMs:0,camera:{recordingCandidate:false,observedAtMs:Date.now()},subject:subject()}});
   const session={sessionId:()=>10,isReliableLinkFresh:()=>true,isActionLinkFresh:()=>true,snapshot:state,
-    centerSticks:async()=>{},
+    centerSticks:async()=>{record('center');},
+    setMovementAxes:axes=>{record('turn',{axes});},
     requestFlight:async action=>{
       record('flight',{action});
       if(action===1){
@@ -134,13 +135,15 @@ test('a ground closeup waits through automatic scan reset and its empty ready re
   });
 });
 
-test('empty candidates after scan readiness time out clearly without a visual request or subject selection',async()=>{
+test('empty candidates after scan readiness search eight two-second views without a visual request or subject selection',async()=>{
   const f=fixture({temporaryCandidate:false,deliverCandidates:false});
   await withReplayClock(f,async()=>{
-    await assert.rejects(f.c.runCloudVoiceRequest('给黑衣男生拍一段特写镜头'),/未找到候选主体.*未开始拍摄/);
+    await assert.rejects(f.c.runCloudVoiceRequest('给黑衣男生拍一段特写镜头'),/8段转向.*未找到主体/);
     assert.equal(f.c.groundDolly.snapshot().stage,'failed');
-    assert.ok(Date.now()-f.takeoffAt()>=30000,'an empty scan must receive the full candidate wait instead of failing on its ready report');
-    assert.ok(Date.now()-f.takeoffAt()<=31000,'the wait must stop at its bounded timeout');
+    const turns=f.events.filter(event=>event.kind==='turn'),centers=f.events.filter(event=>event.kind==='center');
+    assert.equal(turns.length,8,'the empty scene is bounded to eight turns');
+    for(const turn of turns){assert.equal(turn.axes.yaw,689);assert.equal(centers.find(center=>center.at>=turn.at).at-turn.at,2000);}
+    assert.ok(Date.now()-f.takeoffAt()<120000,'search remains inside its total deadline');
     assert.deepEqual(f.events.filter(event=>event.kind==='cloud').map(event=>event.purpose),['ground_dolly_intent']);
     assert.equal(f.events.some(event=>event.kind==='selection'),false);
     assert.equal(f.events.filter(event=>event.kind==='scan-reset').length,1);

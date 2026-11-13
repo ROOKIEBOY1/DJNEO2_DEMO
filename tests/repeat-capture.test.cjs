@@ -46,8 +46,10 @@ function fixture({missedOriginal=false}={}){
   Object.assign(c,{agentGeneration:0,activeOperations:0,busyValue:false,lastErrorValue:'',lastErrorLayerValue:'',
     latestAgentRequestId:'',acceptedAgentRequestId:'',agentMediaUris:[],agentMediaUri:'',agentMediaKind:'video',
     agentVideoResultReady:false,agentFeedback:'',emit(){},log(message){events.push(['log',message]);},
-    // These media-recovery tests substitute scan/frame boundaries; scan readiness has its own real-path replay.
+    // These media-recovery tests substitute scan/frame boundaries. The real
+    // settling path is covered by auto-subject-search-controller.test.cjs.
     waitForAutomaticSubjectScan:async()=>{},
+    settleSubjectSearch:async()=>Date.now(),
     groundDolly:new SubjectTaskWorkflow(()=>{}),closeupSequence:new CloseupSequence(()=>{}),
     closeupMedia:new CloseupMediaGroup(),captureMedia:capture,session,flight:new FlightCommandService(session),
     video:{snapshot:()=>({state:'live'})},
@@ -68,10 +70,13 @@ function fixture({missedOriginal=false}={}){
   c.connectSelectedAircraft=async()=>{events.push(['connect']);throw Error('unexpected reconnection');};
   c.captureAgentObservation=async()=>{
     const id='repeat-'+(++request);c.latestAgentRequestId=id;
+    const capturedAtMs=Date.now();
     return {requestId:id,sessionId:10,flightGeneration:c.flight.snapshot().generation,
-      controlGeneration:c.agentGeneration,requestedAtMs:Date.now(),
+      controlGeneration:c.agentGeneration,requestedAtMs:capturedAtMs,
       context:{flightStateFresh:true,airborne,framing:'半身',zoom:3,retreat:true},
-      frame:airborne?{candidates:[{id:13}],currentSubjectId:selected}:undefined};
+      frame:airborne?{sessionId:10,capturedAtMs,candidatesObservedAtMs:capturedAtMs,
+        jpeg:new ArrayBuffer(4),width:2,height:2,
+        candidates:[{id:13}],currentSubjectId:selected}:undefined};
   };
   c.requestCloudAgentAction=async observation=>{
     events.push(['cloud',observation.purpose]);

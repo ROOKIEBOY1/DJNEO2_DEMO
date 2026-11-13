@@ -5,7 +5,7 @@ const {axesForMovement}=require('../entry/src/main/ets/core/protocol/StickCodec.
 
 async function replay(interrupt){
   let now=1000,fresh=true;const events=[];
-  const service=new FlightCommandService({isActionLinkFresh:()=>fresh,
+  const service=new FlightCommandService({sessionId:()=>1,isActionLinkFresh:()=>fresh,
     requestFlight:async()=>Uint8Array.of(0),
     setMovementAxes:axes=>events.push({kind:'axes',axes,at:now}),
     centerSticks:async()=>events.push({kind:'center',at:now})});

@@ -10,6 +10,9 @@ function fixture(){
     tracking:selected!==undefined,overlay:selected===undefined?boxes:[{id:selected}],selectedIdCandidate:selected});
   Object.assign(c,{agentGeneration:0,emit(){},log(){},finishAgentObservation(id){calls.push(['finish',id]);},
     ensureAgentObservation(){},busyValue:false,isOrdinarySubjectHover:()=>true,
+    // This fixture checks retained task parameters/confirmation. Search motion
+    // and the real stable-hover barrier have dedicated Controller replays.
+    ensureDollyHoverReady(){},settleSubjectSearch:async()=>Date.now(),
     video:{snapshot:()=>({state:'live'})},groundDolly:new SubjectTaskWorkflow(()=>{}),captureMedia:{hasPending:()=>false},
     session:{sessionId:()=>10,isReliableLinkFresh:()=>true,snapshot:()=>({phase:'ready',telemetry:{
       flight:{airborne,motorsOn:airborne},flightAgeMs:0,task:{phaseRaw:0,modeRaw:0},subject:subject()}})},
@@ -19,7 +22,7 @@ function fixture(){
     c.latestAgentRequestId=`r${++request}`;
     return {requestId:c.latestAgentRequestId,sessionId:10,flightGeneration:gen,
     controlGeneration:0,requestedAtMs:Date.now(),context:{flightStateFresh:true,airborne,framing:'全身',zoom:2,retreat:true},
-    frame:airborne?{candidates:boxes,currentSubjectId:selected}:undefined};
+    frame:airborne?{sessionId:10,capturedAtMs:Date.now(),candidatesObservedAtMs:Date.now(),candidates:boxes,currentSubjectId:selected}:undefined};
   };
   c.requestCloudAgentAction=async(obs,text)=>{
     calls.push(['cloud',obs.purpose,obs.flightGeneration,text]);

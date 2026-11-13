@@ -171,14 +171,16 @@ test('camera or task deterioration after plan confirmation prevents an airborne 
 });
 
 test('the first airborne visual inference cannot be reused after its response lifetime expires',async()=>{
-  const {c,events}=fixture();const capture=c.captureAgentObservation;const realNow=Date.now;
+  const {c,events}=fixture();const capture=c.captureAgentObservation;const realNow=Date.now,realTimeout=global.setTimeout;
   let now=realNow(),captures=0;Date.now=()=>now;
+  // The search settles before capturing: advance the same clock for its waits.
+  global.setTimeout=(callback,delay,...args)=>{now+=Number(delay)||0;queueMicrotask(()=>callback(...args));return 0;};
   c.captureAgentObservation=async()=>{if(++captures===2)now+=21000;return capture();};
   try{
     await assert.rejects(c.runCloudVoiceRequest('给黑衣男生拍特写'),/过期/);
     assert.equal(events.some(event=>event[0]==='transport'||event[0]==='closeup'||event[0]==='takeoff'),false);
     assert.equal(events.filter(event=>event[0]==='cloud').length,1);
-  }finally{Date.now=realNow;}
+  }finally{Date.now=realNow;global.setTimeout=realTimeout;}
 });
 
 test('a candidate disappearing from the fresh frame prevents selection based on an older inference',async()=>{

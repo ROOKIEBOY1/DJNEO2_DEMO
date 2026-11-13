@@ -205,3 +205,20 @@ test('cancellation or expiry during response decoding cannot return a selection'
     }, { onDecode: state => { if (mode === 'cancelled') current = false; else state.advance(20001); } });
   }
 });
+
+test('subject search remaining budget bounds the HTTP timeout and rejects a late selection', async () => {
+  await withClient([{ command: selected, after: state => state.advance(251) }], async (client, state) => {
+    const deadline = state.now() + 250;
+    await assert.rejects(client.request(observation(state.now()), '拍白衣男生', () => true, deadline), /过期|超时/);
+    assert.equal(state.requests.length, 1);
+    assert.equal(state.requests[0].configuration.transfer.timeout.transferMs, 250);
+    assert.equal(state.requests[0].configuration.transfer.timeout.connectMs, 250);
+  });
+});
+
+test('an exhausted subject search budget never sends a cloud request', async () => {
+  await withClient([], async (client, state) => {
+    await assert.rejects(client.request(observation(state.now()), '拍白衣男生', () => true, state.now()), /过期|超时/);
+    assert.equal(state.requests.length, 0);
+  });
+});

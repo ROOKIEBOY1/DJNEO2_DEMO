@@ -90,7 +90,7 @@ for(const interrupt of ['cancel','land','stop','link','ground','generation','ses
       if(pending)await pending;
       assert.equal(triggered,true);assert.equal(f.events.filter(x=>x[0]==='axes').length,1);
       assert.equal(f.c.flight.snapshot().movementActive,false);assert.equal(f.c.busyValue,false);
-      assert.ok(f.events.some(x=>x[0]==='center'));
+      assert.equal(f.events.some(x=>x[0]==='center'),!['generation','session'].includes(interrupt));
       assert.equal(f.events.some(x=>x[0]==='flight'&&x[1]===2),interrupt==='land');
     },now=>{
       if(triggered||now<1150||!f)return;triggered=true;

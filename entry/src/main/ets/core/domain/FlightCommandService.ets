@@ -26,6 +26,7 @@ export class FlightCommandService {
   private landSentValue: boolean = false;
   private landAcknowledgedValue: boolean = false;
   private movementActiveValue: boolean = false;
+  private movementOwnerValue: number = 0;
   private generationValue: number = 1;
   private activeToken: CancellationToken = new CancellationToken(1);
   private cycleEvidenceAtMs: number = 0;
@@ -54,6 +55,7 @@ export class FlightCommandService {
   }
 
   resetForAircraftSession(): void {
+    this.movementOwnerValue++;
     this.generationValue++;
     this.activeToken.cancel();
     this.activeToken = new CancellationToken(this.generationValue);
@@ -124,12 +126,16 @@ export class FlightCommandService {
       return failure(ErrorLayer.FLIGHT, 'MOVEMENT_CONTEXT_CHANGED', '连续基础运动的飞行状态已变化，后续步骤未执行');
     }
     this.movementActiveValue = true;
+    const owner = ++this.movementOwnerValue;
+    const generation = this.generationValue;
+    const sessionId = this.session.sessionId();
     const serviceToken = this.activeToken;
     this.session.setMovementAxes(axesForMovement(direction));
     const deadline = Date.now() + seconds * 1000;
     try {
       while (Date.now() < deadline) {
-        if (this.landRequestedValue || serviceToken.isCancelled() ||
+        if (!this.ownsMovement(owner, generation, sessionId, serviceToken) ||
+          this.landRequestedValue || serviceToken.isCancelled() ||
           (token !== undefined && token.isCancelled()) ||
           (token !== undefined && token.generation() !== this.generationValue)) {
           return failure(ErrorLayer.TASK, 'MOVEMENT_CANCELLED', 'Movement was cancelled and sticks were centered');
@@ -143,17 +149,32 @@ export class FlightCommandService {
         }
         await delay(Math.min(50, Math.max(1, deadline - Date.now())));
       }
+      if (!this.ownsMovement(owner, generation, sessionId, serviceToken)) {
+        return failure(ErrorLayer.TASK, 'MOVEMENT_CANCELLED', 'Movement owner or aircraft session changed');
+      }
       if (canContinue !== undefined && !canContinue()) {
         return failure(ErrorLayer.FLIGHT, 'MOVEMENT_CONTEXT_CHANGED', '连续基础运动的飞行状态已变化，后续步骤未执行');
       }
       return success(true);
     } finally {
-      this.movementActiveValue = false;
-      await this.session.centerSticks();
+      // A session change can retire this owner's busy flag, but must never
+      // send a center command into the replacement aircraft session.
+      if (owner === this.movementOwnerValue && generation === this.generationValue && serviceToken === this.activeToken) {
+        this.movementActiveValue = false;
+        if (sessionId === this.session.sessionId()) await this.session.centerSticks();
+      }
     }
   }
 
+  private ownsMovement(owner: number, generation: number, sessionId: number, serviceToken: CancellationToken): boolean {
+    return owner === this.movementOwnerValue && generation === this.generationValue &&
+      sessionId === this.session.sessionId() && serviceToken === this.activeToken;
+  }
+
   async centerSticks(): Promise<OperationResult<boolean>> {
+    // Retire the previous owner before another command can take the sticks.
+    this.movementOwnerValue++;
+    this.movementActiveValue = false;
     this.activeToken.cancel();
     this.activeToken = new CancellationToken(this.generationValue);
     try {
